@@ -1,0 +1,10 @@
+{
+  "name": "@voltline/common",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Seeded PRNG and injectable clock shared by every Voltline package",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

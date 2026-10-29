@@ -1,0 +1,23 @@
+{
+  "name": "@voltline/gateway",
+  "version": "0.0.0",
+  "private": true,
+  "description": "OCPP 1.6J WebSocket gateway: one connection per charger",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@voltline/availability": "workspace:*",
+    "@voltline/billing": "workspace:*",
+    "@voltline/common": "workspace:*",
+    "@voltline/db": "workspace:*",
+    "@voltline/ocpp": "workspace:*",
+    "ioredis": "6.0.0",
+    "pino": "10.4.0",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2"
+  }
+}

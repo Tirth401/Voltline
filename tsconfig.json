@@ -1,0 +1,30 @@
+{
+  // Type-check only. Node 24 runs the .ts files directly by stripping types (DECISIONS.md D-003),
+  // so nothing is ever emitted.
+  "compilerOptions": {
+    "target": "es2024",
+    "lib": ["es2024"],
+    "module": "nodenext",
+    "moduleResolution": "nodenext",
+    "types": ["node"],
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "verbatimModuleSyntax": true,
+    "erasableSyntaxOnly": true,
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "skipLibCheck": true
+  },
+  "include": [
+    "packages/*/src",
+    "packages/*/scripts",
+    "services/*/src",
+    "simulator/src",
+    "scripts",
+    "tests",
+    "*.ts"
+  ]
+}

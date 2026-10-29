@@ -1,0 +1,14 @@
+{
+  "name": "@voltline/availability",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Live connector status in Redis, newest report wins",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "dependencies": {
+    "ioredis": "6.0.0"
+  }
+}

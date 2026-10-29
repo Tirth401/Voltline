@@ -1,0 +1,19 @@
+{
+  "name": "@voltline/simulator",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Seeded fake chargers that speak OCPP 1.6J and record exactly what they did",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@voltline/common": "workspace:*",
+    "@voltline/ocpp": "workspace:*",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2",
+    "@voltline/billing": "workspace:*"
+  }
+}

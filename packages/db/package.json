@@ -1,0 +1,17 @@
+{
+  "name": "@voltline/db",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Postgres/TimescaleDB schema migrations, connection pools, and per-test databases",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./testing": "./src/testing.ts"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  },
+  "devDependencies": {
+    "@types/pg": "8.23.1"
+  }
+}

@@ -1,0 +1,41 @@
+{
+  "name": "voltline",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Simplified EV charging backend (CSMS) speaking OCPP 1.6J over WebSockets",
+  "type": "module",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "prereqs": "node scripts/prereqs.ts",
+    "check": "tsc && eslint . && prettier --check . && vitest run --project unit",
+    "typecheck": "tsc",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project unit",
+    "test:integration": "vitest run --project integration",
+    "test:all": "vitest run",
+    "db:up": "docker compose up --detach --wait",
+    "db:down": "docker compose down",
+    "db:reset": "docker compose down --volumes && docker compose up --detach --wait",
+    "db:migrate": "node --env-file-if-exists=.env packages/db/src/cli.ts migrate",
+    "db:seed": "node --env-file-if-exists=.env packages/db/src/cli.ts seed-demo",
+    "gateway": "node --env-file-if-exists=.env services/gateway/src/main.ts",
+    "sim": "node simulator/src/cli.ts",
+    "smoke": "node --env-file-if-exists=.env scripts/smoke.ts",
+    "ocpp:types": "node packages/ocpp/scripts/generate-types.ts && prettier --write packages/ocpp/src/v16/types.generated.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.13.0",
+    "fast-check": "4.10.2",
+    "prettier": "3.9.10",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.72.1",
+    "vitest": "5.0.5"
+  }
+}

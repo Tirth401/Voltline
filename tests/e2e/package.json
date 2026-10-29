@@ -1,0 +1,20 @@
+{
+  "name": "@voltline/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "description": "End-to-end tests: simulated chargers against a real gateway, Postgres and Redis",
+  "type": "module",
+  "dependencies": {
+    "@voltline/availability": "workspace:*",
+    "@voltline/db": "workspace:*",
+    "@voltline/gateway": "workspace:*",
+    "@voltline/ocpp": "workspace:*",
+    "@voltline/simulator": "workspace:*",
+    "ioredis": "6.0.0",
+    "pino": "10.4.0",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@types/ws": "8.18.2"
+  }
+}
