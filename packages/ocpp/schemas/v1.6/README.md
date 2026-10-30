@@ -16,7 +16,15 @@ the gateway validates every message against them.
 ## Rules
 
 - **Don't edit these files.** If a schema needs a workaround, put it in code (`packages/ocpp/src`)
-  and record why in `DECISIONS.md`.
-- **Read the license in the OCA download** before making the repo public.
+  and record why in `DECISIONS.md`. Their license forbids changed copies (see below).
 - The separate **OCPP 1.6 Security Whitepaper** adds more schemas (for example
   `SecurityEventNotification.json`). We don't use them, so leave them out.
+
+## License and attribution
+
+The 56 `.json` files in this folder are copyright © Open Charge Alliance. The OCPP 1.6 package
+they come from states that it is made available under the
+[Creative Commons Attribution-NoDerivatives 4.0 International Public License](https://creativecommons.org/licenses/by-nd/4.0/legalcode).
+That license allows sharing unmodified copies with credit, which is what this folder does. The
+files are byte-for-byte identical to the official download, and their license is separate from
+the rest of this repository.
