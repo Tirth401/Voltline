@@ -4,7 +4,7 @@ import { createTestRedis, deleteKeysWithPrefix } from '@voltline/availability/te
 import { createTestDatabase, type TestDatabase } from '@voltline/db/testing';
 import { createGateway, type Gateway } from '@voltline/gateway';
 import { createV16Validator } from '@voltline/ocpp';
-import { OcppClient, runSession, type SessionGroundTruth } from '@voltline/simulator';
+import { OcppClient, runSession, type SessionTruth } from '@voltline/simulator';
 import type { Redis } from 'ioredis';
 import { pino } from 'pino';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -58,7 +58,7 @@ const countReadings = async (transactionId: number): Promise<number> => {
 };
 
 describe('one charger, one full session', () => {
-  let truth: SessionGroundTruth;
+  let truth: SessionTruth;
 
   beforeAll(async () => {
     truth = await runSession({

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
@@ -8,6 +9,7 @@ import type { V16Validator } from '@voltline/ocpp';
 import type { Logger } from 'pino';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
 import { ChargerConnection } from './connection.ts';
+import type { FrameLog } from './frame-log.ts';
 import { createDispatcher } from './handlers.ts';
 
 export interface GatewayOptions {
@@ -16,10 +18,14 @@ export interface GatewayOptions {
   validator: V16Validator;
   logger: Logger;
   clock?: Clock;
+  /** Records every frame in and out, for replay (D-023). */
+  frameLog?: FrameLog;
   /** Told to chargers in BootNotification.conf: how often to send a Heartbeat. Default 300 s. */
   heartbeatIntervalSec?: number;
   /** How long to wait for a charger to answer a CALL we send. Default 30 s. */
   callTimeoutMs?: number;
+  /** How often to ping each socket; one that misses a pong is dropped (D-026). Default 30 s. */
+  pingIntervalMs?: number;
   /** Also check our own responses against the schemas. On in tests; costs a little CPU. */
   validateResponses?: boolean;
 }
@@ -44,12 +50,15 @@ const MAX_FRAME_BYTES = 1024 * 1024;
  */
 export function createGateway(options: GatewayOptions): Gateway {
   const log = options.logger;
+  const clock = options.clock ?? systemClock;
+  const { frameLog } = options;
   const callTimeoutMs = options.callTimeoutMs ?? 30_000;
+  const pingIntervalMs = options.pingIntervalMs ?? 30_000;
   const connections = new Map<string, ChargerConnection>();
   const dispatch = createDispatcher({
     db: options.db,
     availability: options.availability,
-    clock: options.clock ?? systemClock,
+    clock,
     heartbeatIntervalSec: options.heartbeatIntervalSec ?? 300,
     validator: options.validator,
     validateResponses: options.validateResponses ?? false,
@@ -109,14 +118,38 @@ export function createGateway(options: GatewayOptions): Gateway {
     // A charger that reconnects has given up on its old socket, so the newest connection wins.
     connections.get(chargePointId)?.close(1000, 'replaced by a newer connection');
 
+    const connectionId = randomUUID();
+    let seq = 0;
     const connection = new ChargerConnection({
       chargePointId,
       socket: ws,
       logger: connectionLog,
       callTimeoutMs,
       answer: (call) => dispatch(chargePointId, call, connectionLog),
+      ...(frameLog && {
+        onFrame: (direction, raw) => {
+          seq += 1;
+          frameLog.record({ chargePointId, connectionId, seq, at: clock.now(), direction, raw });
+        },
+      }),
     });
     connections.set(chargePointId, connection);
+
+    // A charger whose network died without a goodbye leaves a socket that looks open forever.
+    // Ping it regularly; if the previous ping got no pong, it's gone (D-026).
+    let answeredLastPing = true;
+    ws.on('pong', () => {
+      answeredLastPing = true;
+    });
+    const pinger = setInterval(() => {
+      if (!answeredLastPing) {
+        connectionLog.warn('no pong since the last ping: dropping the connection');
+        ws.terminate();
+        return;
+      }
+      answeredLastPing = false;
+      ws.ping();
+    }, pingIntervalMs);
 
     ws.on('message', (data: RawData, isBinary: boolean) => {
       if (isBinary) {
@@ -126,6 +159,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       connection.receive(rawDataToText(data));
     });
     ws.on('close', (code: number) => {
+      clearInterval(pinger);
       connection.closed();
       if (connections.get(chargePointId) === connection) connections.delete(chargePointId);
       connectionLog.info({ code }, 'disconnected');

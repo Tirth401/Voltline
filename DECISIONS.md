@@ -110,6 +110,9 @@ CALLERROR.
 **Why.** OCPP 1.6 lets a charger give up on a transaction message after `TransactionMessageAttempts`
 error responses. A CALLERROR for "unknown transaction" would quietly delete billing data.
 
+**Update (M2).** A StopTransaction for an unknown session is now kept too: the frame log (D-023)
+stores every frame, so the evidence is there to review.
+
 ## D-009 · Energy is computed from stored evidence, never kept as a running total
 
 _2026-10-29_
@@ -319,3 +322,84 @@ time the server received them. The simulator runs each charger on a virtual cloc
 **Why.** A charger that was offline sends its messages late, but the session still happened when
 the charger says it did. It also means a simulated hour of charging takes milliseconds, which is
 what makes 5,000-session runs practical.
+
+## D-023 · Every frame is logged, and a charger's trace can be replayed
+
+_2026-10-29_
+
+**Decision.** The gateway records every frame in and out to `ocpp_frames`, in batches and off the
+critical path, with its connection id and its position in that connection. `replayCalls` feeds a
+charger's recorded CALLs through the same handlers again, in the recorded order, with the clock
+set to each call's original arrival time.
+
+**Why.** Seeds reproduce scenarios, not runs (D-011). When a distributed run fails, the recorded
+trace is what lets us reproduce exactly what billing saw. Every M2 run also replays every charger
+into an empty database and checks that all the bills come out the same.
+
+**Transaction-id translation.** In OCPP 1.6 the server assigns transaction ids, and the replay
+database assigns its own, in a different order. So the replay reads each StartTransaction's
+recorded answer, maps the original id to the new one, and rewrites later MeterValues and
+StopTransaction to match. The first version skipped this and got almost every bill wrong; the
+replay test caught it.
+
+**Cost.** Frames still in the buffer when a process dies are lost. That costs a trace, never money:
+billing commits its own evidence before any ack goes out (D-005).
+
+## D-024 · A reading that arrives after its session stopped re-bills the session
+
+_2026-10-29_
+
+**Decision.** When new readings belong to a session that has already stopped, it's billed again
+from all its evidence, under the session's row lock. The readings' insert commits on its own
+first; only then is the lock taken. A second StopTransaction that contradicts the first leaves the
+first bill in place and marks the session `needs_review`.
+
+**Why.** A charger flushing a shuffled offline queue can deliver MeterValues after StopTransaction,
+and around a meter reset such a reading changes the bill. Because the insert commits before the
+lock, a stop racing with the reading either sees the reading or commits first and is then
+re-billed. A test races the two 20 times.
+
+## D-025 · How the simulator misbehaves
+
+_2026-10-29_
+
+**Decision.** Each simulated charger keeps StartTransaction, MeterValues and StopTransaction in an
+outbox and resends each until it gets an answer: at-least-once delivery, as OCPP 1.6 asks of
+chargers. On top of that, each charger's seeded stream decides:
+
+- **Offline spells.** A third begin before the session does, so its StartTransaction is sent late.
+- **Lost answers.** The charger sends the same message again.
+- **Connections dropped right after sending.** The charger reconnects and sends it again.
+- **Shuffled queues** after an offline spell. StartTransaction stays first, because nothing else
+  can carry a transactionId before that answer arrives.
+- **Meter resets.** Reported with `Interruption.Begin` and `Interruption.End` readings, or
+  unreported.
+
+**Why.** These are the ways deliveries go wrong without anything being lost for good, which is the
+contract billing has to survive. Each test run asserts that every kind of fault actually happened,
+so a run can't pass by quietly injecting nothing.
+
+**Not modelled yet.** Charger clock jumps, chargers that give up on a message for good, and
+gateway crashes (M3).
+
+## D-026 · Dead connections are found with WebSocket pings
+
+_2026-10-29_
+
+**Decision.** Every 30 s the gateway pings each socket. If the previous ping got no pong, the
+socket is terminated.
+
+**Why.** A charger whose network vanishes sends no closing frame, so its socket looks open forever
+and its identity stays bound to a dead connection. A test checks both sides: a client that stops
+answering is dropped, and one that answers is kept.
+
+## D-027 · Milestone 2 focuses on billing; commands and allocation move to Milestone 3
+
+_2026-10-29_
+
+**Decision.** RemoteStartTransaction, RemoteStopTransaction, TriggerMessage and the smart-charging
+allocator moved from M2 to M3.
+
+**Why.** With one builder instead of four teammates working in parallel, order matters more.
+Server-initiated commands belong with cross-pod command routing (M3), and the allocator with the
+charging controller that uses it (M3). M2 stays on its exit check.

@@ -30,6 +30,8 @@ export interface ConnectionOptions {
   logger: Logger;
   /** How long to wait for the charger to answer a CALL we sent. */
   callTimeoutMs: number;
+  /** Sees every frame received and every frame sent, in order: for the frame log (D-023). */
+  onFrame?: (direction: 'in' | 'out', raw: string) => void;
 }
 
 interface PendingCall {
@@ -54,6 +56,7 @@ export class ChargerConnection {
   readonly #answer: ConnectionOptions['answer'];
   readonly #log: Logger;
   readonly #callTimeoutMs: number;
+  readonly #onFrame: ConnectionOptions['onFrame'];
   readonly #pending = new Map<string, PendingCall>();
   #inbound: Promise<void> = Promise.resolve();
   #outbound: Promise<unknown> = Promise.resolve();
@@ -65,10 +68,12 @@ export class ChargerConnection {
     this.#answer = options.answer;
     this.#log = options.logger;
     this.#callTimeoutMs = options.callTimeoutMs;
+    this.#onFrame = options.onFrame;
   }
 
   /** Every text frame from the socket comes through here. */
   receive(text: string): void {
+    this.#onFrame?.('in', text);
     const parsed = parseFrame(text);
     if (!parsed.ok) {
       this.#log.warn({ reason: parsed.reason, frame: text.slice(0, 200) }, 'malformed frame');
@@ -162,6 +167,8 @@ export class ChargerConnection {
   }
 
   #send(text: string): void {
-    if (!this.#closed) this.#socket.send(text);
+    if (this.#closed) return;
+    this.#socket.send(text);
+    this.#onFrame?.('out', text);
   }
 }

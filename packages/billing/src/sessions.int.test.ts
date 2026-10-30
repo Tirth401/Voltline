@@ -117,7 +117,7 @@ describe('meter values and stop', () => {
       })
     ).transactionId;
 
-  it('keeps each reading once, and bills from start, readings and stop', async () => {
+  it('keeps each reading once, bills from all the evidence, and flags a conflicting second stop', async () => {
     const transactionId = await begin(3, 10, 500);
     const samples = [
       energySample(11, 700),
@@ -125,8 +125,8 @@ describe('meter values and stop', () => {
       energySample(12, 7_400, { measurand: 'Power.Active.Import', unit: 'W' }),
     ];
     const meterValues = { chargePointId: 'CP-1', connectorId: 3, transactionId, samples };
-    expect(await recordMeterValues(db.pool, meterValues)).toBe(3);
-    expect(await recordMeterValues(db.pool, meterValues)).toBe(0);
+    expect(await recordMeterValues(db.pool, meterValues)).toEqual({ inserted: 3 });
+    expect(await recordMeterValues(db.pool, meterValues)).toEqual({ inserted: 0 });
 
     const stop = {
       chargePointId: 'CP-1',
@@ -156,7 +156,67 @@ describe('meter values and stop', () => {
       'SELECT state, energy_wh FROM transactions WHERE transaction_id = $1',
       [transactionId],
     );
-    expect(rows[0]).toEqual({ state: 'stopped', energy_wh: 700 });
+    // The first stop's bill stands; the contradiction is left for a person to look at.
+    expect(rows[0]).toEqual({ state: 'needs_review', energy_wh: 700 });
+  });
+
+  it('bills a stopped session again when readings arrive late and change the answer', async () => {
+    const transactionId = await begin(6, 40, 10_000);
+    const stop = await stopTransaction(db.pool, {
+      chargePointId: 'CP-1',
+      transactionId,
+      meterStopWh: 3_000,
+      stoppedAt: at(44),
+      samples: [],
+    });
+    // Alone, a stop below the start looks like a reset straight to the final value.
+    expect(stop).toEqual({ outcome: 'stopped', energyWh: 3_000, resetsDetected: 1 });
+
+    const late = await recordMeterValues(db.pool, {
+      chargePointId: 'CP-1',
+      connectorId: 6,
+      transactionId,
+      samples: [energySample(41, 14_800), energySample(42, 200)],
+    });
+    expect(late).toEqual({ inserted: 2, rebilled: { previousWh: 3_000, energyWh: 7_800 } });
+
+    // A reading that doesn't change the bill is stored, and nothing is re-billed.
+    const harmless = await recordMeterValues(db.pool, {
+      chargePointId: 'CP-1',
+      connectorId: 6,
+      transactionId,
+      samples: [energySample(43, 1_100)],
+    });
+    expect(harmless).toEqual({ inserted: 1 });
+  });
+
+  it('never loses a reading that races its own session stop', async () => {
+    // A late reading and the stop arrive at the same moment on different connections. Whichever
+    // commits first, the bill must include the reading that reveals the reset.
+    for (let round = 0; round < 20; round++) {
+      const connectorId = 100 + round;
+      const transactionId = await begin(connectorId, 0, 10_000);
+      await Promise.all([
+        stopTransaction(db.pool, {
+          chargePointId: 'CP-1',
+          transactionId,
+          meterStopWh: 3_000,
+          stoppedAt: at(4),
+          samples: [],
+        }),
+        recordMeterValues(db.pool, {
+          chargePointId: 'CP-1',
+          connectorId,
+          transactionId,
+          samples: [energySample(1, 14_800), energySample(2, 200)],
+        }),
+      ]);
+      const { rows } = await db.pool.query<{ energy_wh: number }>(
+        'SELECT energy_wh FROM transactions WHERE transaction_id = $1',
+        [transactionId],
+      );
+      expect(rows[0]?.energy_wh, `round ${round}`).toBe(7_800);
+    }
   });
 
   it('stitches a meter reset that the readings show', async () => {

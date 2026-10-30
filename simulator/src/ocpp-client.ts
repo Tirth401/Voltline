@@ -76,17 +76,36 @@ export class OcppClient {
     action: A,
     payload: V16Request<A>,
   ): Promise<V16Response<A>> {
+    const response = await this.callPayload(action, payload as unknown as Payload);
+    return response as unknown as V16Response<A>;
+  }
+
+  /** `call`, for code that holds the payload untyped. Checked against the schemas all the same. */
+  async callPayload(action: V16ChargerAction, payload: Payload): Promise<Payload> {
     const request = this.#validator?.request(action, payload);
     if (request && !request.ok) throw new Error(`simulator bug: ${action} ${request.description}`);
-    const response = await this.callUnchecked(action, payload as unknown as Payload);
+    const response = await this.callUnchecked(action, payload);
     const check = this.#validator?.response(action, response);
     if (check && !check.ok) throw new Error(`gateway bug: ${action} response ${check.description}`);
-    return response as unknown as V16Response<A>;
+    return response;
   }
 
   /** Sends anything at all, unchecked: for testing how the gateway handles bad input. */
   callUnchecked(action: string, payload: Payload): Promise<Payload> {
     const next = this.#queue.then(() => this.#send(action, payload));
+    this.#queue = next.catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * Sends a CALL and hangs up straight away, without waiting for the answer: the network dropping
+   * mid-message. The gateway may or may not process it; either way the charger must send it again.
+   */
+  sendThenClose(action: string, payload: Payload): Promise<void> {
+    const next = this.#queue.then(async () => {
+      this.#ws.send(serializeCall(String(this.#nextMessageId++), action, payload));
+      await this.close();
+    });
     this.#queue = next.catch(() => undefined);
     return next;
   }

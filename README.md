@@ -5,18 +5,19 @@ chargers using OCPP 1.6J over WebSockets. It rebuilds the hard core of a real ch
 billing that stays exact when chargers misbehave, site power caps that are never exceeded, and
 fast recovery when the gateway restarts.
 
-> **Status:** Milestone 1 is done. A simulated charger completes a full session through the
-> gateway, and the stored bill matches the charger's own record to the watt-hour. Next is
-> Milestone 2: the same guarantee under duplicates, offline replay, reordering and meter resets.
-> See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status:** Milestone 2 is done. With one gateway, 500 seeded sessions full of faults are billed
+> to the watt-hour, three seeds out of three: chargers go offline and send StartTransaction late,
+> lose answers, hang up mid-message, shuffle their queues, and reset their meters. Next is
+> Milestone 3: several gateways, killed mid-run. See [docs/ROADMAP.md](docs/ROADMAP.md).
 
 ## What we're setting out to prove
 
-These are targets, not results yet. Each will get a write-up in `docs/results/` with the exact
-command, seed, date and raw numbers.
+Each result gets a write-up in `docs/results/` with the exact command, seed, date and raw numbers.
 
 1. **Billing:** zero discrepancies across 5,000 simulated sessions with injected faults (offline
    periods, duplicate messages, out-of-order meter values, meter resets, gateway pod kills).
+   _So far: 500 sessions, one gateway, no kills, three seeds, zero discrepancies
+   ([write-up](docs/results/m2-billing-under-faults.md))._
 2. **Smart charging:** no site exceeds its power cap across 1,000 simulated load changes.
 3. **Recovery:** 2,000 simulated chargers reconnect after a gateway pod restart in Kubernetes
    (kind), measured from the chargers' side.
@@ -56,6 +57,22 @@ pnpm smoke
   session.
 - `pnpm smoke`: starts the real gateway, runs one simulated session through it, and checks the
   bill.
+
+## Billing under faults
+
+```bash
+pnpm faults --sessions 500 --chargers 50 --seed 1
+```
+
+This runs simulated chargers that misbehave (D-025) against a real gateway, then checks every
+session: billed exactly what its readings prove, stored once, and rebuilt identically by replaying
+its recorded frames into an empty database. The same seed always produces the same faults. If a
+run fails, its database schema is kept and the output prints the command to replay the failing
+charger:
+
+```bash
+pnpm replay --schema <kept schema> --charger <chargePointId>
+```
 
 ## Running it by hand
 

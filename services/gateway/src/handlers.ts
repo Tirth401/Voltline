@@ -104,12 +104,18 @@ const handlers: { [A in V16ChargerAction]: Handler<A> } = {
   },
 
   MeterValues: async (ctx, request) => {
-    await recordMeterValues(ctx.db, {
+    const { rebilled } = await recordMeterValues(ctx.db, {
       chargePointId: ctx.chargePointId,
       connectorId: request.connectorId,
       transactionId: request.transactionId,
       samples: toSamples(request.meterValue),
     });
+    if (rebilled) {
+      ctx.log.info(
+        { transactionId: request.transactionId, ...rebilled },
+        'late readings changed a stopped session: billed again (D-024)',
+      );
+    }
     return {};
   },
 

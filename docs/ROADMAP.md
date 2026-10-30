@@ -27,28 +27,35 @@ the simulator's ground truth; resending StartTransaction returns the same transa
 - [x] End-to-end test of a full session, plus `pnpm smoke` through the real gateway process and simulator CLI
 - [ ] kind trial run: 2,000 WebSocket connections into one pod from a Job inside the cluster
 
-**Known gaps, carried into M2:** a StopTransaction for an unknown session is acknowledged and
-logged but not stored (that needs the raw frame log); readings that arrive after their session's
-stop are stored but don't trigger a re-bill yet.
+**Known gaps found in M1, both fixed in M2:** a StopTransaction for an unknown session was
+acknowledged but not stored (the frame log now keeps it), and readings that arrived after their
+session's stop didn't trigger a re-bill (they do now, D-024).
 
-## M2 · Weeks 3–4 · Correct under faults, one gateway
+## M2 · Weeks 3–4 · Correct under faults, one gateway (done)
 
 **Exit check:** 500 seeded sessions with duplicates, offline replay (late StartTransaction),
 out-of-order MeterValues and meter resets give 0 discrepancies and 0 lost or invented sessions;
 any failure replays from its trace.
 
-- [ ] Billing state machine (active → stopped → settled, plus needs_review), write-once stops, recalculation under a row lock
-- [ ] Simulator fault injection, scenario generator, per-session report (billed / evidenced / physical)
-- [ ] Gateway: queue for server-sent CALLs (one in flight per charger), newest connection wins, ping/pong dead-socket detection, raw frame log
-- [ ] RemoteStartTransaction, RemoteStopTransaction, TriggerMessage
-- [ ] Trace capture and replay into billing
-- [ ] Smart-charging allocator and change planner (pure functions, property-tested at every step of a plan)
+**Result:** three seeds of 500 sessions, each with 0 discrepancies, 0 lost, 0 invented, and every
+bill reproduced by replay. Details and limitations:
+[results/m2-billing-under-faults.md](results/m2-billing-under-faults.md).
+
+- [x] Billing: late readings re-bill a stopped session under its row lock; stops are write-once; a conflicting second stop marks the session needs_review
+- [x] Simulator: a charger outbox that resends until answered; seeded fault plans (offline spells and late starts, lost answers, dropped connections, shuffled queues, reported and unreported meter resets); a fleet runner
+- [x] Per-session check (billed / evidenced / physical, readings, transaction ids) and `pnpm faults`
+- [x] Gateway: raw frame log and ping/pong dead-connection detection (the one-in-flight CALL queue and newest-connection-wins were already done in M1)
+- [x] Trace capture and replay into billing, with transaction-id translation; `pnpm replay`
+- Moved to M3 (D-027): RemoteStartTransaction, RemoteStopTransaction, TriggerMessage, and the smart-charging allocator and change planner
+- Moved to M3, as planned: settlement (active → stopped → settled)
 
 ## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1
 
 **Exit check:** 5,000 sessions survive gateway process kills with 0 discrepancies; a command sent
 through gateway A reaches a charger connected to gateway B; the cap holds across 200 load changes.
 
+- [ ] RemoteStartTransaction, RemoteStopTransaction, TriggerMessage (moved from M2)
+- [ ] Smart-charging allocator and change planner: pure functions, property-tested at every step of a plan (moved from M2)
 - [ ] Redis connection registry with a per-connection counter, so a stale socket on the old pod gets closed instead of used
 - [ ] Pod-to-pod commands over Redis pub/sub with a reply and a timeout (deliberately not a durable queue)
 - [ ] Graceful shutdown on SIGTERM
