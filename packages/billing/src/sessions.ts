@@ -94,7 +94,12 @@ export interface MeterValuesResult {
   /** Readings that weren't already stored. */
   inserted: number;
   /** Set when the readings belonged to a session that had already stopped, and changed its bill. */
-  rebilled?: { previousWh: number | null; energyWh: number };
+  rebilled?: {
+    previousWh: number | null;
+    energyWh: number;
+    /** The bill had already settled, so the change went in as a correction (D-034). */
+    corrected: boolean;
+  };
 }
 
 /**
@@ -103,7 +108,8 @@ export interface MeterValuesResult {
  *
  * Readings can arrive after their session's StopTransaction (a charger flushing a shuffled offline
  * queue, say), and around a meter reset they change the answer. So if the session has already
- * stopped, it's billed again from all its evidence (D-024).
+ * stopped, it's billed again from all its evidence (D-024). If its bill had already settled, the
+ * change is recorded as a correction (D-034).
  */
 export async function recordMeterValues(
   pool: Pool,
@@ -163,14 +169,25 @@ async function rebillIfStopped(
       ts: session.stopped_at,
       wh: session.meter_stop_wh,
     });
+    // New evidence, whether or not it changes the bill: the charger may still be flushing its
+    // queue, so the session waits before it settles (D-034).
+    await client.query(
+      `UPDATE transactions SET energy_wh = $2, resets_detected = $3, last_evidence_at = now()
+        WHERE transaction_id = $1`,
+      [transactionId, bill.energyWh, bill.resetsDetected],
+    );
     if (bill.energyWh === session.energy_wh && bill.resetsDetected === session.resets_detected) {
       return undefined;
     }
-    await client.query(
-      'UPDATE transactions SET energy_wh = $2, resets_detected = $3 WHERE transaction_id = $1',
-      [transactionId, bill.energyWh, bill.resetsDetected],
-    );
-    return { previousWh: session.energy_wh, energyWh: bill.energyWh };
+    const corrected = session.state === 'settled' && bill.energyWh !== session.energy_wh;
+    if (corrected) {
+      // A settled bill is never edited in place: the change goes on top of it as a correction.
+      await client.query(
+        'INSERT INTO bill_corrections (transaction_id, previous_wh, energy_wh) VALUES ($1, $2, $3)',
+        [transactionId, session.energy_wh, bill.energyWh],
+      );
+    }
+    return { previousWh: session.energy_wh, energyWh: bill.energyWh, corrected };
   });
 }
 
@@ -216,7 +233,7 @@ export async function stopTransaction(
         session.meter_stop_wh === input.meterStopWh;
       if (!matches) {
         await client.query(
-          `UPDATE transactions SET state = 'needs_review' WHERE transaction_id = $1`,
+          'UPDATE transactions SET needs_review = true WHERE transaction_id = $1',
           [input.transactionId],
         );
       }
@@ -244,7 +261,7 @@ export async function stopTransaction(
     await client.query(
       `UPDATE transactions
           SET stopped_at = $2, meter_stop_wh = $3, stop_reason = $4, stop_received_at = now(),
-              energy_wh = $5, resets_detected = $6, state = 'stopped'
+              energy_wh = $5, resets_detected = $6, state = 'stopped', last_evidence_at = now()
         WHERE transaction_id = $1`,
       [
         input.transactionId,
@@ -260,6 +277,7 @@ export async function stopTransaction(
 }
 
 interface LockedSession {
+  state: 'active' | 'stopped' | 'settled';
   connector_id: number;
   started_at: Date;
   meter_start_wh: number;
@@ -276,7 +294,7 @@ async function lockSession(
   transactionId: number,
 ): Promise<LockedSession | undefined> {
   const { rows } = await client.query<LockedSession>(
-    `SELECT connector_id, started_at, meter_start_wh, stopped_at, meter_stop_wh,
+    `SELECT state, connector_id, started_at, meter_start_wh, stopped_at, meter_stop_wh,
             energy_wh, resets_detected
        FROM transactions
       WHERE transaction_id = $1 AND charge_point_id = $2

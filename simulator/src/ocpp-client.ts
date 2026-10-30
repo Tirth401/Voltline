@@ -25,6 +25,8 @@ export interface ClientOptions {
    * OcppCallError to answer with a CALLERROR. Without it, every command gets NotImplemented.
    */
   onCall?: (action: string, payload: Payload) => Promise<Payload>;
+  /** Called once the connection has closed, whoever closed it. */
+  onClose?: () => void;
 }
 
 /** The gateway answered the WebSocket upgrade with an HTTP error instead of a socket. */
@@ -79,6 +81,7 @@ export class OcppClient {
     });
     ws.on('close', () => {
       this.#fail(new Error('connection closed'));
+      options.onClose?.();
     });
     // A gateway killed mid-conversation resets the connection. Without a listener, that 'error'
     // event would crash the whole simulator; with one, the waiting call fails and is retried.

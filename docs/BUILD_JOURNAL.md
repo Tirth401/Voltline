@@ -418,6 +418,104 @@ not good enough, so I wrote the script.
 The numbers are in
 [results/m3-smart-charging-cap.md](results/m3-smart-charging-cap.md).
 
+### Part 5: settling the bills
+
+**The problem.** Until now, a bill could change at any time. A reading that arrived late would
+quietly re-bill its session, even hours later. That is fine for a database, but not for a
+business. At some point a bill becomes an invoice, or it is sent to the driver's provider. A
+quiet change after that would make our records disagree with what the customer paid.
+
+**The idea: settle, then correct** (D-034):
+
+- A stopped session **settles** once no new evidence for it has arrived for a while: 15 minutes by
+  default. Its bill at that moment is frozen.
+- If evidence arrives after that and changes the amount, the frozen bill is never edited. Instead
+  we add a **correction**: the old amount, the new amount, and the difference. It works like a
+  credit note in accounting.
+- So at every moment: frozen bill + corrections = the bill the evidence proves.
+
+**Why "quiet for 15 minutes" and not "15 minutes after the stop"?** A charger that reconnects
+after being offline sends its whole queue, and readings for a session can come after its stop.
+Each new piece of evidence starts the clock again, so we wait until the charger has caught up.
+
+**What if a late reading and settlement happen at the same moment?** The reading locks the
+session's row while it re-bills. Settlement waits for that lock, and then Postgres checks the
+session again, with the reading's changes. So either the reading is inside the frozen bill, or it
+becomes a correction. It is never lost and never counted twice. A test runs this race 20 times.
+
+**Testing it the hard way.** In the fault runs, a settler runs with no quiet period at all: every
+session settles the moment it stops, while chargers misbehave and gateways crash. Any evidence
+that comes later then _must_ become a correction. The checker requires three things: every
+session is settled, its frozen bill plus its corrections equals its bill, and corrections only
+appear on sessions that really had readings after their stop. In three 5,000-session crash runs,
+every session settled while the chargers were still running, there were 7, 10 and 13
+corrections, and every check held. With one second of quiet instead of none, there were 0
+([results](results/m3-settlement-corrections.md)).
+
+**A small fix to "needs review".** It used to be one of the states, next to "stopped". But a
+session can need a person's attention whether it is stopped or settled, so it became a separate
+flag. In a state machine, the states should exclude each other.
+
+**What I learned:**
+
+- **Never edit a record that has left the building.** Add a correction instead, so the history
+  stays true.
+- **One idempotent SQL statement is the simplest background job there is.** It is safe to run
+  anywhere, any number of times, even twice at the same moment. In Kubernetes it can be a
+  CronJob.
+- **Make the rare path happen on purpose.** With a realistic quiet period, corrections almost
+  never happen, so a quiet period of zero is what proves they work.
+
+### Part 6: 2,000 chargers come back
+
+**The question.** The third goal is about recovery: when a gateway restarts, how fast do 2,000
+chargers get back? To answer it later in Kubernetes, the simulator first had to hold 2,000
+chargers at once and measure their reconnects honestly.
+
+**What was built** (D-035):
+
+- **An idle charger.** It connects, boots, says its connector is free, and then just stays
+  connected. When the connection drops, it tries again with exponential backoff and jitter, and
+  writes down two times: when it noticed the loss, and when a gateway accepted it again.
+- **`pnpm storm`.** It starts three real gateway processes and 2,000 idle chargers at the same
+  moment, kills one gateway (or all three) with SIGKILL, and starts it again a moment later.
+
+**Measuring honestly.** Three rules:
+
+1. **Measure from the charger's side.** A gateway only sees the chargers that reach it. A charger
+   that keeps failing never appears in the gateway's numbers.
+2. **Report percentiles and the maximum, never only an average.** The slowest chargers are the
+   ones a car-park operator calls about.
+3. **Cross-check with a second source.** Before the kill, the Redis registry says which chargers
+   are on the doomed gateway. The chargers that report a lost connection must be exactly those.
+   Otherwise a charger that never noticed the outage would simply be missing from the numbers.
+
+**What happened.** Every charger came back in every run, and the registry agreed every time.
+With one gateway killed, most chargers were back within a few hundred milliseconds, because they
+picked a surviving gateway on their first or second try. With all three killed for 2 seconds, the
+last charger was back about 2 seconds after the gateways were. That is the backoff cap: a charger
+that has just started a 2-second wait sits it out.
+
+**A surprise about jitter.** Jitter means each charger waits a _random_ part of its backoff, so
+they don't all retry at the same moment. I expected it to help. So I added a baseline without
+jitter, where every charger retries in step. That baseline recovered 0.6 seconds _faster_: all
+2,000 chargers tried again at the same instant, and the gateways accepted them all within half a
+second. So jitter didn't buy speed here. It is insurance for when a wave is bigger than the
+gateways can handle: then chargers in step fail together and retry together, again and again. My
+gateways had capacity to spare, so the insurance only cost time. I reported it that way, instead
+of claiming jitter "won".
+
+**What I learned:**
+
+- **Measure the claim you were about to make.** I almost wrote "jitter turns a spike into a
+  slope, so it's better". The baseline showed the real trade-off.
+- **Count who is missing.** Percentiles only describe the chargers that came back. The registry
+  cross-check proves that nobody silently dropped out of the numbers.
+- **A restart leaves connections uneven.** After one gateway restarted, almost no charger went
+  back to it. Real systems need a way to rebalance, which is future work.
+
+The numbers are in [results/m3-reconnect-storm.md](results/m3-reconnect-storm.md).
+
 ---
 
 ## Lessons that apply to any backend

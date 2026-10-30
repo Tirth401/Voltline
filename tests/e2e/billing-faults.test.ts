@@ -5,6 +5,7 @@ import {
   makeChargers,
   registerChargers,
   replayAndCompare,
+  startSettler,
   startStack,
   validator,
   type BillingReport,
@@ -28,10 +29,14 @@ const HARSH: FaultProfile = {
 let stack: Stack;
 let fleet: FleetResult;
 let report: BillingReport;
+let settled: { whileRunning: number; atTheEnd: number };
 
 beforeAll(async () => {
   stack = await startStack();
   await registerChargers(stack.db.pool, chargers);
+  // Settlement runs all the way through with no quiet period, so a session settles as soon as it
+  // stops, and any evidence after that has to go in as a correction (D-034).
+  const settler = startSettler(stack.db.pool, { quietMs: 0, everyMs: 5 });
   fleet = await runFleet({
     gatewayUrl: stack.gatewayUrl,
     chargers,
@@ -41,7 +46,8 @@ beforeAll(async () => {
     validator,
   });
   await stack.frameLog.flush();
-  report = await checkBilling(stack.db.pool, fleet.sessions);
+  settled = await settler.stop();
+  report = await checkBilling(stack.db.pool, fleet.sessions, { settled: true });
 }, 120_000);
 
 afterAll(async () => {
@@ -65,6 +71,12 @@ describe(`billing under faults (seed ${SEED}, ${SESSIONS} sessions, one gateway)
       invented: 0,
       discrepancies: 0,
     });
+  });
+
+  it('settles every session while the chargers run, and corrects instead of editing', () => {
+    // checkBilling also holds each session to: settled bill + corrections = bill.
+    expect(report.settlement?.settled).toBe(SESSIONS);
+    expect(settled.whileRunning).toBeGreaterThan(0);
   });
 
   it('never bills more than flowed', () => {

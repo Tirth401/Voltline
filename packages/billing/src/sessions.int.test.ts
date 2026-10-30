@@ -152,12 +152,15 @@ describe('meter values and stop', () => {
       matches: false,
     });
 
-    const { rows } = await db.pool.query<{ state: string; energy_wh: number }>(
-      'SELECT state, energy_wh FROM transactions WHERE transaction_id = $1',
-      [transactionId],
-    );
+    const { rows } = await db.pool.query<{
+      state: string;
+      needs_review: boolean;
+      energy_wh: number;
+    }>('SELECT state, needs_review, energy_wh FROM transactions WHERE transaction_id = $1', [
+      transactionId,
+    ]);
     // The first stop's bill stands; the contradiction is left for a person to look at.
-    expect(rows[0]).toEqual({ state: 'needs_review', energy_wh: 700 });
+    expect(rows[0]).toEqual({ state: 'stopped', needs_review: true, energy_wh: 700 });
   });
 
   it('bills a stopped session again when readings arrive late and change the answer', async () => {
@@ -178,7 +181,10 @@ describe('meter values and stop', () => {
       transactionId,
       samples: [energySample(41, 14_800), energySample(42, 200)],
     });
-    expect(late).toEqual({ inserted: 2, rebilled: { previousWh: 3_000, energyWh: 7_800 } });
+    expect(late).toEqual({
+      inserted: 2,
+      rebilled: { previousWh: 3_000, energyWh: 7_800, corrected: false },
+    });
 
     // A reading that doesn't change the bill is stored, and nothing is re-billed.
     const harmless = await recordMeterValues(db.pool, {

@@ -122,7 +122,29 @@ export function createApi(options: ApiOptions): Api {
         );
         const session = rows[0];
         if (!session) throw new HttpError(404, `no session ${transactionId}`);
-        return { status: 200, body: toSession(session) };
+        // Changes to the bill after it settled, oldest first (D-034).
+        const { rows: corrections } = await db.query<{
+          created_at: Date;
+          previous_wh: number;
+          energy_wh: number;
+          delta_wh: number;
+        }>(
+          `SELECT created_at, previous_wh, energy_wh, delta_wh
+             FROM bill_corrections WHERE transaction_id = $1 ORDER BY correction_id`,
+          [session.transaction_id],
+        );
+        return {
+          status: 200,
+          body: {
+            ...toSession(session),
+            corrections: corrections.map((correction) => ({
+              at: correction.created_at,
+              previousWh: correction.previous_wh,
+              energyWh: correction.energy_wh,
+              deltaWh: correction.delta_wh,
+            })),
+          },
+        };
       },
     ],
 
@@ -193,7 +215,8 @@ export function createApi(options: ApiOptions): Api {
 
 const SESSION_COLUMNS = `
   SELECT transaction_id, charge_point_id, connector_id, id_tag, auth_status, started_at,
-         stopped_at, meter_start_wh, meter_stop_wh, energy_wh, resets_detected, state, stop_reason
+         stopped_at, meter_start_wh, meter_stop_wh, energy_wh, resets_detected, state, stop_reason,
+         needs_review, settled_at, settled_energy_wh
     FROM transactions`;
 
 interface SessionRow {
@@ -210,6 +233,9 @@ interface SessionRow {
   resets_detected: number;
   state: string;
   stop_reason: string | null;
+  needs_review: boolean;
+  settled_at: Date | null;
+  settled_energy_wh: number | null;
 }
 
 function toSession(row: SessionRow) {
@@ -227,6 +253,10 @@ function toSession(row: SessionRow) {
     resetsDetected: row.resets_detected,
     state: row.state,
     stopReason: row.stop_reason,
+    needsReview: row.needs_review,
+    settledAt: row.settled_at,
+    /** The bill when it settled; energyWh is this plus any corrections since (D-034). */
+    settledEnergyWh: row.settled_energy_wh,
   };
 }
 

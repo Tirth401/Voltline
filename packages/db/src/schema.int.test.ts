@@ -21,6 +21,7 @@ describe('migrations', () => {
       [db.schema],
     );
     expect(rows.map((row) => row.table_name)).toEqual([
+      'bill_corrections',
       'charge_points',
       'id_tags',
       'meter_readings',
@@ -71,6 +72,16 @@ describe('transactions', () => {
       [db.schema],
     );
     expect(rows[0]?.data_type).toBe('integer');
+  });
+
+  it('refuse to mark a session settled without the bill it settled with (D-034)', async () => {
+    const start = ['CP-1', 2, 'TAG-1', 'Accepted', '2026-01-01T11:00:00Z', 0];
+    const { rows } = await db.pool.query<{ transaction_id: number }>(insertStart, start);
+    await expect(
+      db.pool.query(`UPDATE transactions SET state = 'settled' WHERE transaction_id = $1`, [
+        rows[0]?.transaction_id,
+      ]),
+    ).rejects.toThrow('settled_bill_is_kept');
   });
 });
 

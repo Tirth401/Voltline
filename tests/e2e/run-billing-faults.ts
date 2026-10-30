@@ -5,6 +5,9 @@
 //   pnpm faults --sessions 5000 --chargers 100 --gateways 3 --chaos --seed 1
 //                                     three gateway processes, killed with SIGKILL as it runs
 //
+// Add --settle-quiet 0 to settle sessions while the chargers run (D-034): a session settles once
+// its evidence has been quiet that many ms, and anything later must arrive as a correction.
+//
 // Add --keep to keep the database schema afterwards (it's always kept when a run fails).
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, writeFileSync } from 'node:fs';
@@ -21,6 +24,7 @@ import {
   makeChargers,
   registerChargers,
   replayAndCompare,
+  startSettler,
   startStack,
   validator,
 } from './harness.ts';
@@ -33,6 +37,7 @@ const { values } = parseArgs({
     chaos: { type: 'boolean', default: false },
     seed: { type: 'string', default: '1' },
     keep: { type: 'boolean', default: false },
+    'settle-quiet': { type: 'string' },
   },
 });
 const sessions = positiveInteger('sessions', values.sessions);
@@ -41,6 +46,11 @@ const gatewayCount = positiveInteger('gateways', values.gateways);
 const seed = Number(values.seed);
 if (!Number.isInteger(seed) || seed < 0 || seed >= 2 ** 32) {
   throw new Error(`--seed must be an integer in [0, 2^32), got "${values.seed}"`);
+}
+const settleQuietMs =
+  values['settle-quiet'] === undefined ? undefined : Number(values['settle-quiet']);
+if (settleQuietMs !== undefined && !(Number.isInteger(settleQuietMs) && settleQuietMs >= 0)) {
+  throw new Error(`--settle-quiet must be a whole number of ms, got "${values['settle-quiet']}"`);
 }
 if (values.chaos && gatewayCount < 2) {
   throw new Error('--chaos needs --gateways 2 or more, so a charger always has somewhere to go');
@@ -54,7 +64,8 @@ const CHAOS = {
 const command =
   `pnpm faults --sessions ${sessions} --chargers ${chargerCount} --seed ${seed}` +
   (gatewayCount > 1 ? ` --gateways ${gatewayCount}` : '') +
-  (values.chaos ? ' --chaos' : '');
+  (values.chaos ? ' --chaos' : '') +
+  (settleQuietMs === undefined ? '' : ` --settle-quiet ${settleQuietMs}`);
 const chargers = makeChargers(chargerCount);
 const fleetOptions = (gatewayUrl: FleetOptions['gatewayUrl']): FleetOptions => ({
   gatewayUrl,
@@ -72,12 +83,16 @@ interface Run {
   fleet: FleetResult;
   runSeconds: number;
   kills: number;
+  /** Sessions settled while the chargers ran, and in one last pass after (with --settle-quiet). */
+  settled: { whileRunning: number; atTheEnd: number } | undefined;
   /** Tears everything down; keeps the schema if asked. */
   finish(keepDatabase: boolean): Promise<void>;
 }
 
 const run = gatewayCount === 1 ? await runInProcess() : await runOnCluster();
-const report = await checkBilling(run.db, run.fleet.sessions);
+const report = await checkBilling(run.db, run.fleet.sessions, {
+  settled: settleQuietMs !== undefined,
+});
 const replay = await replayAndCompare(
   { db: run.db, redis: run.redis, logger: pino({ level: 'warn' }) },
   chargers,
@@ -103,6 +118,13 @@ console.log(
       `${n(report.lost)} lost, ${n(report.invented)} invented`,
     `  bills      ${n(report.discrepancies)} discrepancies (billed ≠ evidenced), ${n(report.problems.length)} sessions with any problem`,
     `  energy     ${n(energy.physicalWh)} Wh flowed, ${n(energy.evidencedWh)} Wh evidenced, ${n(energy.billedWh)} Wh billed`,
+    ...(report.settlement && run.settled
+      ? [
+          `  settled    ${n(report.settlement.settled)} sessions (${n(run.settled.whileRunning)} while the chargers ran, ` +
+            `quiet period ${String(settleQuietMs)} ms); ${n(report.settlement.corrections)} corrections on ` +
+            `${n(report.settlement.correctedSessions)} sessions, ${n(report.settlement.correctionsWh)} Wh in total`,
+        ]
+      : []),
     `  replay     ${n(replay.sessions)} sessions rebuilt from recorded frames, ${n(replay.mismatches.length)} mismatches`,
     `  time       ${run.runSeconds.toFixed(1)} s for the chargers to finish`,
     ...run.fleet.failures.map(
@@ -136,6 +158,8 @@ writeFileSync(
       chaos: values.chaos ? CHAOS : null,
       kills: run.kills,
       faultProfile: DEFAULT_FAULTS,
+      settleQuietMs: settleQuietMs ?? null,
+      settled: run.settled ?? null,
       runSeconds: run.runSeconds,
       passed: !failed,
       report,
@@ -165,6 +189,7 @@ if (failed) {
 async function runInProcess(): Promise<Run> {
   const stack = await startStack({ logLevel: 'warn' });
   await registerChargers(stack.db.pool, chargers);
+  const settler = startSettlerIfAsked(stack.db.pool);
   const started = performance.now();
   const fleet = await runFleet(fleetOptions(stack.gatewayUrl));
   const runSeconds = (performance.now() - started) / 1000;
@@ -176,6 +201,7 @@ async function runInProcess(): Promise<Run> {
     fleet,
     runSeconds,
     kills: 0,
+    settled: await settler?.stop(),
     finish: (keepDatabase) => stack.stop({ keepDatabase }),
   };
 }
@@ -192,6 +218,7 @@ async function runOnCluster(): Promise<Run> {
     redisPrefix,
   });
   const chaos = values.chaos ? startChaos({ cluster, seed, ...CHAOS }) : undefined;
+  const settler = startSettlerIfAsked(db.pool);
   const started = performance.now();
   const fleet = await runFleet(fleetOptions(cluster.urls));
   const runSeconds = (performance.now() - started) / 1000;
@@ -205,6 +232,7 @@ async function runOnCluster(): Promise<Run> {
     fleet,
     runSeconds,
     kills,
+    settled: await settler?.stop(),
     async finish(keepDatabase) {
       await deleteKeysWithPrefix(redis, redisPrefix);
       await redis.quit();
@@ -212,6 +240,13 @@ async function runOnCluster(): Promise<Run> {
       else await db.drop();
     },
   };
+}
+
+/** With --settle-quiet, settles sessions in this process while the chargers run (D-034). */
+function startSettlerIfAsked(db: Pool) {
+  return settleQuietMs === undefined
+    ? undefined
+    : startSettler(db, { quietMs: settleQuietMs, everyMs: 10 });
 }
 
 function positiveInteger(name: string, value: string): number {

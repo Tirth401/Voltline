@@ -1,0 +1,12 @@
+{
+  "name": "@voltline/settlement",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Settles stopped sessions once their evidence has gone quiet",
+  "type": "module",
+  "dependencies": {
+    "@voltline/billing": "workspace:*",
+    "@voltline/db": "workspace:*",
+    "pino": "10.4.0"
+  }
+}

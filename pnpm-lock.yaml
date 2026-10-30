@@ -312,6 +312,18 @@ importers:
         specifier: 8.18.2
         version: 8.18.2
 
+  services/settlement:
+    dependencies:
+      '@voltline/billing':
+        specifier: workspace:*
+        version: link:../../packages/billing
+      '@voltline/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      pino:
+        specifier: 10.4.0
+        version: 10.4.0
+
   simulator:
     dependencies:
       '@voltline/common':
@@ -339,6 +351,9 @@ importers:
       '@voltline/availability':
         specifier: workspace:*
         version: link:../../packages/availability
+      '@voltline/billing':
+        specifier: workspace:*
+        version: link:../../packages/billing
       '@voltline/charging-controller':
         specifier: workspace:*
         version: link:../../services/charging-controller

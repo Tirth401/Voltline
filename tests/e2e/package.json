@@ -7,6 +7,7 @@
   "dependencies": {
     "@voltline/api": "workspace:*",
     "@voltline/availability": "workspace:*",
+    "@voltline/billing": "workspace:*",
     "@voltline/charging-controller": "workspace:*",
     "@voltline/common": "workspace:*",
     "@voltline/db": "workspace:*",

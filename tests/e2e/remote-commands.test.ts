@@ -3,6 +3,13 @@ import { once } from 'node:events';
 import { createApi, type Api } from '@voltline/api';
 import { AvailabilityStore } from '@voltline/availability';
 import { createTestRedis, deleteKeysWithPrefix } from '@voltline/availability/testing';
+import {
+  recordMeterValues,
+  settleDueSessions,
+  startTransaction,
+  stopTransaction,
+  type MeterSample,
+} from '@voltline/billing';
 import { Prng } from '@voltline/common';
 import { createTestDatabase, type TestDatabase } from '@voltline/db/testing';
 import { createGateway, type Gateway } from '@voltline/gateway';
@@ -202,6 +209,52 @@ describe('commands through the API', () => {
       state: 'stopped',
       stopReason: 'Remote',
       energyWh: truth?.evidencedWh,
+    });
+  });
+});
+
+describe('the sessions API', () => {
+  it('shows when a bill settled, and every correction made after that (D-034)', async () => {
+    const reading = (ts: string, wh: number): MeterSample => ({
+      ts: new Date(ts),
+      measurand: 'Energy.Active.Import.Register',
+      phase: '',
+      location: 'Outlet',
+      context: 'Sample.Periodic',
+      unit: 'Wh',
+      rawValue: String(wh),
+    });
+    const where = { chargePointId: CHARGER.chargePointId, connectorId: 9 };
+    // The stop alone bills 3,000 Wh. Readings that reveal a meter reset arrive after it settled.
+    const { transactionId } = await startTransaction(db.pool, {
+      ...where,
+      idTag: CHARGER.idTag,
+      meterStartWh: 10_000,
+      startedAt: new Date('2026-01-01T08:00:00Z'),
+      now: new Date(),
+    });
+    await stopTransaction(db.pool, {
+      chargePointId: CHARGER.chargePointId,
+      transactionId,
+      meterStopWh: 3_000,
+      stoppedAt: new Date('2026-01-01T08:04:00Z'),
+      samples: [],
+    });
+    await settleDueSessions(db.pool, { quietMs: 0 });
+    await recordMeterValues(db.pool, {
+      ...where,
+      transactionId,
+      samples: [reading('2026-01-01T08:01:00Z', 14_800), reading('2026-01-01T08:02:00Z', 200)],
+    });
+
+    const { status, body } = await request('GET', `/sessions/${transactionId}`);
+    expect(status).toBe(200);
+    expect(body).toMatchObject({
+      state: 'settled',
+      needsReview: false,
+      settledEnergyWh: 3_000,
+      energyWh: 7_800,
+      corrections: [{ previousWh: 3_000, energyWh: 7_800, deltaWh: 4_800 }],
     });
   });
 });

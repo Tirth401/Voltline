@@ -5,7 +5,7 @@ chargers using OCPP 1.6J over WebSockets. It rebuilds the hard core of a real ch
 billing that stays exact when chargers misbehave, site power caps that are never exceeded, and
 fast recovery when the gateway restarts.
 
-> **Status:** Milestone 3's exit check is met.
+> **Status:** Milestone 3 is done. Kubernetes (Milestone 4) is next.
 >
 > - **Billing under crashes:** 5,000 seeded sessions full of faults are billed to the watt-hour
 >   while three gateway processes are killed with SIGKILL as they run (three seeds out of three).
@@ -14,7 +14,10 @@ fast recovery when the gateway restarts.
 >   with chargers refusing limits, losing answers and dropping offline, and the controller
 >   restarting, the limits the chargers applied never added up to more than the cap (ten runs out
 >   of ten). At a calm pace the chargers got 88–89% of the spare power.
-> - **Next:** settlement and the 2,000-charger simulator, then Kubernetes (Milestone 4).
+> - **Settlement:** a bill becomes final once its evidence goes quiet; evidence after that becomes
+>   a correction, never a silent edit. Checked while gateways are being killed.
+> - **Reconnect storms:** 2,000 simulated chargers all come back after one gateway, or all three,
+>   are killed, measured from the chargers' side.
 >
 > See [docs/ROADMAP.md](docs/ROADMAP.md). To learn how it was built, start with
 > [docs/BUILD_JOURNAL.md](docs/BUILD_JOURNAL.md).
@@ -33,6 +36,8 @@ Each result gets a write-up in `docs/results/` with the exact command, seed, dat
    the cap held in every run ([write-up](docs/results/m3-smart-charging-cap.md))._
 3. **Recovery:** 2,000 simulated chargers reconnect after a gateway pod restart in Kubernetes
    (kind), measured from the chargers' side.
+   _So far: with gateway processes on one laptop, every charger came back in every run
+   ([write-up](docs/results/m3-reconnect-storm.md)). Kubernetes comes in Milestone 5._
 
 ## Prerequisites
 
@@ -78,7 +83,9 @@ pnpm faults --sessions 5000 --chargers 100 --gateways 3 --chaos --seed 1
 ```
 
 The first runs one gateway inside the test process. The second starts three gateway processes and
-kills one with SIGKILL every 0.5 to 1.5 seconds while the chargers run (D-029).
+kills one with SIGKILL every 0.5 to 1.5 seconds while the chargers run (D-029). Add
+`--settle-quiet 0` to settle every session the moment its evidence stops, while the chargers still
+run: evidence that comes later must then arrive as a correction (D-034).
 
 This runs simulated chargers that misbehave (D-025) against real gateways, then checks every
 session: billed exactly what its readings prove, stored once, and rebuilt identically by replaying
@@ -109,6 +116,19 @@ The default pace, a change every 10 to 40 ms, is a stress test: faster than the 
 50 ms tick. `--gap 150-450` is a fairer pace for usefulness. `--restart-every` restarts the
 controller every so many milliseconds, and it forgets everything each time.
 
+## Reconnect storms
+
+```bash
+pnpm storm --chargers 2000 --gateways 3 --kill one --down 1000 --seed 1
+pnpm storm --chargers 2000 --gateways 3 --kill all --down 2000 --seed 1
+```
+
+Each command starts three gateway processes and 2,000 idle chargers at once, kills one gateway
+(or all of them) with SIGKILL, and starts it again after the given milliseconds. Every charger
+measures how long it took to be accepted again, and the run checks that the chargers that noticed
+the outage are exactly the ones the registry had on the killed gateways (D-035). Add `--no-jitter`
+for the baseline where every charger backs off in step.
+
 ## Running it by hand
 
 ```bash
@@ -119,7 +139,9 @@ pnpm sim --charger CP-DEMO-1 --tag TAG-DEMO-1 --seed 42
 ```
 
 `db:seed` registers the demo site, chargers and id tag. `pnpm controller` keeps the demo site
-under its cap (one controller per site; `SITE_ID` picks another). The gateway listens on
+under its cap (one controller per site; `SITE_ID` picks another). `pnpm settle` settles stopped
+sessions whose evidence has been quiet for 15 minutes (`SETTLE_QUIET_MS`), every minute, or once
+with `--once`. The gateway listens on
 `ws://localhost:9220/ocpp/{chargePointId}`; set `PORT`, `HEARTBEAT_INTERVAL_S` or `LOG_LEVEL` to
 change it. Run `pnpm sim` in a second terminal: it prints the charger's ground truth, including
 `physicalWh` and `evidencedWh`, which you can compare with `energy_wh` in the `transactions`
@@ -131,7 +153,7 @@ The API listens on `http://localhost:9230`:
 | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `GET /chargers/{id}`                    | The charger's details, which gateway holds it, and its connectors' live status                                                                                           |
 | `GET /chargers/{id}/sessions`           | Its last 50 sessions, with their bills                                                                                                                                   |
-| `GET /sessions/{transactionId}`         | One session and its bill                                                                                                                                                 |
+| `GET /sessions/{transactionId}`         | One session, its bill, and any corrections made after it settled (D-034)                                                                                                 |
 | `POST /chargers/{id}/commands/{action}` | Sends any OCPP command the backend may send (body: the payload), through whichever gateway holds the charger (D-030). Charging limits are left to the controller (D-032) |
 
 ## Layout
@@ -152,9 +174,10 @@ voltline/
 ├── services/
 │   ├── api/                  REST: chargers, sessions and bills, commands to chargers
 │   ├── charging-controller/  keeps each site under its power cap with leased limits
-│   └── gateway/              the OCPP 1.6J WebSocket server, its handlers and frame log
+│   ├── gateway/              the OCPP 1.6J WebSocket server, its handlers and frame log
+│   └── settlement/           settles stopped sessions once their evidence goes quiet
 ├── simulator/                seeded chargers that misbehave and record their own ground truth
-├── tests/e2e/                end-to-end tests, the fault, crash and cap harnesses, pnpm faults / cap / replay
+├── tests/e2e/                end-to-end tests and harnesses: pnpm faults / cap / storm / replay
 └── scripts/                  prereqs.ts (machine check), smoke.ts (run it for real)
 ```
 

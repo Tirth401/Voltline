@@ -26,10 +26,12 @@
     "gateway": "node --env-file-if-exists=.env services/gateway/src/main.ts",
     "api": "node --env-file-if-exists=.env services/api/src/main.ts",
     "controller": "node --env-file-if-exists=.env services/charging-controller/src/main.ts",
+    "settle": "node --env-file-if-exists=.env services/settlement/src/main.ts",
     "sim": "node simulator/src/cli.ts",
     "smoke": "node --env-file-if-exists=.env scripts/smoke.ts",
     "faults": "node --env-file-if-exists=.env tests/e2e/run-billing-faults.ts",
     "cap": "node --env-file-if-exists=.env tests/e2e/run-cap-check.ts",
+    "storm": "node --env-file-if-exists=.env tests/e2e/run-storm.ts",
     "replay": "node --env-file-if-exists=.env tests/e2e/replay-cli.ts",
     "ocpp:types": "node packages/ocpp/scripts/generate-types.ts && prettier --write packages/ocpp/src/v16/types.generated.ts"
   },

@@ -49,14 +49,14 @@ bill reproduced by replay. Details and limitations:
 - Moved to M3 (D-027): RemoteStartTransaction, RemoteStopTransaction, TriggerMessage, and the smart-charging allocator and change planner
 - Moved to M3, as planned: settlement (active → stopped → settled)
 
-## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1 (exit check met)
+## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1 (done)
 
 **Exit check:** 5,000 sessions survive gateway process kills with 0 discrepancies; a command sent
 through the API reaches a charger through whichever gateway holds it; the cap holds across 200
 load changes.
 
-**Done:** all three parts of the exit check. Settlement and the 2,000-charger simulator are still
-open.
+**Done:** all three parts of the exit check, settlement, and a simulator that holds 2,000
+chargers through a reconnect storm.
 
 - **Billing under crashes:** 5,000 sessions with gateway kills, on three seeds. Every run had
   0 discrepancies, 0 lost, 0 invented, and every bill was rebuilt by replay
@@ -68,6 +68,10 @@ open.
   refusing limits, losing answers and dropping offline, and the controller restarting. Two broken
   controllers break the cap in the integration tests, so the check can fail. Usefulness is
   reported next to safety: 88–89% at a calm pace ([results](results/m3-smart-charging-cap.md)).
+- **Settlement:** every session settled while gateways were being killed, and every bill that
+  changed after settling did so through a correction ([results](results/m3-settlement-corrections.md)).
+- **2,000 chargers:** after killing one gateway, or all three, every charger came back and the
+  registry agreed on where each one was ([results](results/m3-reconnect-storm.md)).
 
 - [x] RemoteStartTransaction, RemoteStopTransaction and TriggerMessage, plus any other CSMS command, all checked against the schemas, through `POST /chargers/:id/commands/:action`
 - [x] Redis connection registry with a per-connection counter (the epoch); a stale socket on the old gateway is closed
@@ -80,8 +84,8 @@ open.
 - [x] Simulator: charger-side charging profiles (one stack level, `validTo` leases, TxDefaultProfile fallback), lost answers, and the applied-limit recorder (D-032)
 - [x] charging-controller: reconcile loop that never waits for answers, unknown outcomes held until their lease is over, a waiting period after each start (D-032, D-033)
 - [x] REST API refuses SetChargingProfile and ClearChargingProfile: limits belong to the controller
-- [ ] Settlement and late-evidence corrections
-- [ ] Simulator at 2,000 concurrent chargers (needed for result 3 in M5)
+- [x] Settlement and late-evidence corrections: a bill settles once its evidence goes quiet, and later evidence becomes a correction (D-034, [results](results/m3-settlement-corrections.md))
+- [x] Simulator at 2,000 concurrent chargers: idle chargers that measure their own reconnects, `pnpm storm`, and a no-jitter baseline (D-035)
 
 ## M4 · Weeks 7–8 · Kubernetes
 
@@ -100,7 +104,7 @@ real pod kills.
 **Exit check:** result 3 measured in three scenarios over several runs, with every run reported;
 SAP's simulator completes a session and accepts a SetChargingProfile.
 
-- [ ] **Result 3:** kill 1 of 3 gateway pods, rolling restart, and all pods down. Measured from the chargers' side: time to reconnect and to the first accepted message (p50/p95/p99/max), attempts, Pending boots, and how unevenly connections spread across pods. Includes a baseline without jitter or rate limiting. Never through `kubectl port-forward`.
+- [ ] **Result 3:** kill 1 of 3 gateway pods, rolling restart, and all pods down (already measured with processes on one laptop in M3: [results](results/m3-reconnect-storm.md)). Measured from the chargers' side: time to reconnect and to the first accepted message (p50/p95/p99/max), attempts, Pending boots, and how unevenly connections spread across pods. Includes a baseline without jitter or rate limiting. Never through `kubectl port-forward`.
 - [ ] Interop with SAP's e-mobility charging station simulator; every incompatibility logged in DECISIONS.md
 - [ ] Smart charging under chaos (controller and gateway pods killed mid-change)
 

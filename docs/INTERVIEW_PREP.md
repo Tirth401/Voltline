@@ -61,6 +61,13 @@ You don't need the same words. You need the same main idea and one concrete exam
 | 3.5 s → 4.8 s            | What the group commit cost on the 500-session run                                              | `DECISIONS.md` D-023                            |
 | 80 + 45                  | Unit tests + integration tests during Milestone 3                                              | `pnpm check`, `pnpm test:integration`           |
 | 90 + 54                  | Unit tests + integration tests once the smart-charging work was done                           | `pnpm check`, `pnpm test:integration`           |
+| 91 + 64                  | Unit tests + integration tests at the end of Milestone 3                                       | `pnpm check`, `pnpm test:integration`           |
+| 7 / 10 / 13              | Corrections in three 5,000-session crash runs that settled every bill the moment it stopped    | `docs/results/m3-settlement-corrections.md`     |
+| 0                        | Corrections in the same seed-1 run with one second of quiet before settling                    | same                                            |
+| 2,000                    | Idle chargers in every reconnect storm; every one came back, in every run                      | `docs/results/m3-reconnect-storm.md`            |
+| 667 / 642 / 686          | Chargers on the killed gateway (one of three), exactly as the registry said                    | same                                            |
+| about 2 s                | After all gateways were killed, the last charger was back about one backoff cap after them     | same                                            |
+| 3.6 s vs 4.3 s           | Full outage, last charger back: without jitter vs with it. Without was faster here             | same                                            |
 | 1,000 load changes × 10  | Smart-charging runs: 20 chargers, a 150 kW cap, chargers refusing limits and losing answers    | `docs/results/m3-smart-charging-cap.md`         |
 | 150,000 W                | The peak in every run: exactly the cap, never a watt more                                      | same                                            |
 | 83 to 469                | Unanswered limit changes per run, each counted as "maybe applied" until its lease ended        | same                                            |
@@ -138,6 +145,29 @@ and just after a reboot make every reset visible.
 The bill equals the energy that the charger's readings can prove. It is not "the bill equals the
 energy that physically flowed", because energy hidden by an unreported reset cannot be proved by
 anyone. We report that gap separately: between 3,514 Wh and 5,186 Wh per 500-session run.
+
+**Q: When is a bill final? Why not just keep re-billing forever?**
+A bill settles once no new evidence for its session has arrived for a quiet period, 15 minutes by
+default. From then on, the settled amount never changes. A real business sends that amount on, as
+an invoice or to the driver's provider, so changing it quietly would make the books disagree. If
+evidence still arrives and changes the amount, I add a correction instead: old amount, new amount,
+difference. The settled bill plus its corrections always equals the bill the evidence proves.
+
+**Q: Why a quiet period, and not a fixed time after the stop?**
+Because a charger that reconnects flushes its queue, and some readings can arrive after the stop.
+Each new piece of evidence restarts the clock, so a charger that is still catching up holds its
+sessions back.
+
+**Q: A late reading and the settlement job hit the same session at the same moment. What happens?**
+The reading locks the session's row while it re-bills. The settlement update waits for the lock,
+and then Postgres checks its `WHERE` again against the new row. So the reading is either inside
+the settled bill or becomes a correction, never lost and never counted twice. A test races two
+settlers and a late reading 20 times.
+
+**Q: How do you test corrections, if they almost never happen?**
+I make them happen on purpose. In the fault runs, a settler with no quiet period settles each
+session the moment it stops, while chargers misbehave and gateways crash. Late evidence must then
+become a correction, and the checker verifies the sum for every session.
 
 ### Reliability
 
@@ -232,6 +262,31 @@ whether it worked, and can retry with fresh information.
 When the new gateway registers the charger, the registry returns the previous owner, and that
 gateway is told to close the old socket. A connection only removes itself from the registry if it
 is still the owner, so an old socket closing late cannot erase the new one.
+
+**Q: How did you measure how fast chargers reconnect after a gateway dies?**
+From the chargers' side. Each simulated charger writes down when it noticed the lost connection
+and when a gateway accepted its BootNotification again. I report p50, p95, p99 and the maximum,
+never only an average, because the slowest chargers are the ones people complain about. With
+2,000 chargers and one of three gateways killed, every charger came back; the slowest took about
+2 seconds.
+
+**Q: How do you know no charger is missing from those numbers?**
+Before the kill, the Redis registry tells me which chargers are on the gateway I'm about to kill.
+The chargers that report a lost connection must be exactly those: 667, 642 and 686 in my three
+runs, and they were. Afterwards, every one of the 2,000 must be registered again.
+
+**Q: Does jitter help?**
+Less than I expected, and I measured it. Without jitter, all 2,000 chargers retried in the same
+instant after a full outage, and the gateways took them all within half a second, so recovery was
+0.6 seconds faster. Jitter is insurance for a wave the gateways can't absorb: chargers in step
+then fail together and retry together, forever. My gateways had spare capacity, so jitter only
+cost time. I'll test it properly once BootNotification rate limiting makes the capacity limit
+real.
+
+**Q: Would the numbers be the same in production?**
+No, they are a lower bound. On one machine, SIGKILL makes the kernel reset the sockets at once, so
+chargers notice immediately. Across a real network a dead server may send nothing, and noticing
+takes until a ping times out. Real chargers also back off for longer than my 2 seconds.
 
 ### Smart charging
 
@@ -350,6 +405,10 @@ Saying these yourself makes you more convincing, not less.
   leader election, and a fresh one sends no new limits for its first 32 seconds.
 - In the cap stress test, cars arrive and leave faster than the controller's tick, so usefulness
   there is low by design. The calmer runs are the fair usefulness number.
+- Corrections are recorded and checked, but nothing sends them anywhere: there is no invoicing. A
+  session whose StopTransaction never arrives never settles.
+- The reconnect numbers are a lower bound: on one machine a killed process's sockets are reset at
+  once, and my backoff cap is 2 s. After a gateway restarts, connections don't rebalance.
 
 ---
 
@@ -379,6 +438,10 @@ Saying these yourself makes you more convincing, not less.
 | Registry               | Here, the Redis record of which gateway holds each charger's connection.                              |
 | Epoch                  | A counter that grows with each new connection of a charger, so newer can be told from older.          |
 | Cap                    | The most power a site may draw at once.                                                               |
+| Settled bill           | A session's bill once its evidence has gone quiet: it is never changed after that.                    |
+| Jitter                 | Waiting a random part of a backoff, so clients that failed together don't all retry together.         |
+| p50 / p95 / p99        | The value that 50% / 95% / 99% of the measurements are at or below.                                   |
+| Correction             | A dated record of a change to a settled bill: old amount, new amount, difference.                     |
 | Default limit          | What a charger may draw with no instructions from us (its TxDefaultProfile).                          |
 | Lease (`validTo`)      | The time a limit stops applying unless it is renewed; then the charger falls back to its default.     |
 | Worst case             | The most a connector might be drawing, given changes we sent but haven't heard back about.            |

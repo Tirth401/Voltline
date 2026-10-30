@@ -113,7 +113,9 @@ const handlers: { [A in V16ChargerAction]: Handler<A> } = {
     if (rebilled) {
       ctx.log.info(
         { transactionId: request.transactionId, ...rebilled },
-        'late readings changed a stopped session: billed again (D-024)',
+        rebilled.corrected
+          ? 'late readings changed a settled bill: recorded a correction (D-034)'
+          : 'late readings changed a stopped session: billed again (D-024)',
       );
     }
     return {};

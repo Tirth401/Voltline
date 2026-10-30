@@ -14,6 +14,7 @@ export {
   type SessionPlan,
 } from './faults.ts';
 export { runFleet, type FleetOptions, type FleetResult } from './fleet.ts';
+export { IdleCharger, type IdleChargerOptions, type Reconnect } from './idle-charger.ts';
 export { Meter } from './meter.ts';
 export { ConnectionRefusedError, OcppClient, type ClientOptions } from './ocpp-client.ts';
 export {

@@ -129,4 +129,27 @@ describe('computeEnergyWh', () => {
     const result = computeEnergyWh(reading(0, 1_000), [reading(10, 1_100)], reading(20, 1_500));
     expect(result).toEqual({ energyWh: 500, resetsDetected: 0 });
   });
+
+  it('never bills less after one more reading: late evidence can only add energy', () => {
+    // So a correction to a settled bill can only ever raise it (D-034).
+    const wh = fc.nat({ max: 1_000_000 });
+    const readings = fc.uniqueArray(fc.record({ minute: fc.integer({ min: 1, max: 59 }), wh }), {
+      selector: (r) => r.minute,
+      minLength: 1,
+      maxLength: 20,
+    });
+    fc.assert(
+      fc.property(wh, wh, readings, (startWh, stopWh, all) => {
+        const asReadings = (list: typeof all) => list.map((r) => reading(r.minute, r.wh));
+        const [, ...withoutTheLateOne] = all;
+        const before = computeEnergyWh(
+          reading(0, startWh),
+          asReadings(withoutTheLateOne),
+          reading(60, stopWh),
+        );
+        const after = computeEnergyWh(reading(0, startWh), asReadings(all), reading(60, stopWh));
+        expect(after.energyWh).toBeGreaterThanOrEqual(before.energyWh);
+      }),
+    );
+  });
 });

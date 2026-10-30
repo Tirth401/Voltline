@@ -602,3 +602,96 @@ still unanswered.
 **What stays the same.** "Decreases go before increases" still holds in the sense that matters
 for safety: no increase uses a watt until the charger giving it up has confirmed. The order in
 which one tick's changes go out never mattered for safety.
+
+## D-034 · Settlement: a bill is final once its evidence goes quiet; later evidence is a correction
+
+_2026-10-30_
+
+**Decision.** A session now goes active → stopped → settled.
+
+- **When it settles.** A stopped session settles once no new evidence for it has arrived for a
+  quiet period: 15 minutes by default. Evidence means its StopTransaction or any new reading for
+  it. The bill at that moment is kept as `settled_energy_wh`, and that never changes again.
+- **Evidence after that.** It is still stored, and the bill is still worked out again from all the
+  evidence (D-009). If the amount changes, the change goes into a `bill_corrections` table: the
+  old amount, the new one, and the difference. So at every moment, the settled bill plus all its
+  corrections equals the current bill.
+- **Review is a flag, not a state.** `needs_review` used to be a state. Now it is a separate
+  column, because a session can need a person's attention whether it is stopped or settled. A
+  flagged session is never settled automatically.
+- **One statement, run anywhere.** Settlement is a single SQL update (`settleDueSessions`). It is
+  safe to run in any process, as often as you like, several at once. `pnpm settle` runs it every
+  minute; with `--once` it runs one pass and exits, as a Kubernetes CronJob would.
+
+**Why.**
+
+- **A settled bill goes out into the world.** It becomes an invoice, or a record sent to the
+  driver's provider. After that, changing it quietly would make the books disagree. A correction
+  is the honest way: the old bill stays as it was, and the difference is a separate, dated record.
+- **The quiet period waits for chargers that are still catching up.** A charger that reconnects
+  flushes its queue, and some readings can arrive after the stop. The clock starts again with each
+  new piece of evidence, so a charger that is still sending holds its sessions back. The cost: a
+  bill waits a while before it is final.
+- **Corrections should be rare.** Late evidence only changes a bill around a meter reset (D-024),
+  so a correction needs a reading that reveals a reset to arrive after its session settled.
+- **Races are safe.** A late reading takes the session's row lock before it bills again. The
+  settlement statement waits for that lock, then judges the session again as the reading left it
+  (Postgres re-checks the `WHERE` on the new row version). So either the reading is in the settled
+  bill, or it becomes a correction. A test races two settlers and a late reading 20 times, and the
+  sum holds every time.
+
+**How it is checked under faults.** The fault harness can run a settler with no quiet period
+while chargers misbehave and gateways crash. Every session then settles within milliseconds of
+its stop, so evidence that comes later has to go in as a correction. The checker requires every
+session to be settled, its settled bill plus its corrections to equal its bill, and corrections
+only on sessions that really had readings after their stop.
+
+**Not yet.** A session whose StopTransaction never arrives stays active forever. Closing such
+sessions after a long silence, and flagging them for review, is future work.
+
+## D-035 · Reconnect storms are measured from the chargers' side, against real processes
+
+_2026-10-30_
+
+**Decision.** The simulator has a second kind of charger, the `IdleCharger`. It connects, boots,
+reports its connector Available, and then stays connected doing nothing. When its connection
+drops, it reconnects to a random gateway with exponential backoff and full jitter (D-028), and
+records two times: when it noticed the loss, and when a gateway accepted its BootNotification
+again. `pnpm storm` starts thousands of them at once against real gateway processes, kills one
+gateway or all of them with SIGKILL, starts them again, and reports:
+
+- for each charger, the time from noticing the loss to being accepted again, as percentiles
+  (p50, p95, p99) and the maximum, never only an average;
+- how many gave up, and how long until the last charger was back;
+- a curve of how many chargers were connected, every 100 ms after the kill;
+- a cross-check with the Redis registry: the chargers that noticed a loss must be exactly the ones
+  the registry had placed on the killed gateways, and afterwards every charger must be registered.
+
+**Why.**
+
+- **The charger's side is the honest side.** A gateway only sees the connections that reach it.
+  A charger that keeps failing to connect never shows up in the gateway's numbers at all.
+- **Percentiles and the maximum, not averages.** The slowest chargers are the ones a car-park
+  operator calls about. An average hides them.
+- **The registry check catches a quiet failure.** If a charger never noticed that its gateway had
+  died, its reconnect time couldn't be measured, and it would simply be missing from the numbers.
+  Comparing with the registry shows that this didn't happen.
+- **Idle chargers isolate the reconnect path.** Sessions, faults and billing are tested elsewhere.
+  Here, every message is a BootNotification or a StatusNotification.
+
+**What the baseline showed.** `--no-jitter` makes every charger wait the full backoff, so they all
+retry in step. After a full outage, that brought all 2,000 back about 0.6 s _sooner_ than with
+jitter, in one wave the gateways absorbed within half a second. So jitter (D-028) is not about
+speed. It protects the gateways when a wave is bigger than they can take: chargers in step then
+fail together and retry together. Here the gateways had capacity to spare. The real test comes
+with BootNotification rate limiting in Milestone 4.
+
+**Known limits.**
+
+- Everything runs on one machine, and SIGKILL makes the kernel reset the sockets at once, so a
+  charger notices the loss immediately. Across a real network a dead peer may send nothing, and
+  noticing takes until the WebSocket ping times out (D-026). The numbers are a lower bound.
+- The backoff cap is 2 s, as everywhere in the tests. With a longer cap, recovery after a full
+  outage takes longer, by about one cap.
+- Connections don't rebalance after a restart: a gateway that comes back late stays almost empty.
+  That needs a rebalancing rule in Milestone 4 or later.

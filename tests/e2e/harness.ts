@@ -3,8 +3,10 @@
  * that compare what simulated chargers did with what billing stored.
  */
 import { randomUUID } from 'node:crypto';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { AvailabilityStore } from '@voltline/availability';
 import { createTestRedis, deleteKeysWithPrefix } from '@voltline/availability/testing';
+import { settleDueSessions } from '@voltline/billing';
 import type { Pool, Queryable } from '@voltline/db';
 import { createTestDatabase, type TestDatabase } from '@voltline/db/testing';
 import {
@@ -118,6 +120,14 @@ export interface BillingReport {
   /** Every session with anything wrong, and what. */
   problems: SessionProblem[];
   energy: { physicalWh: number; evidencedWh: number; billedWh: number };
+  /** Set when sessions were settled while the chargers ran (D-034). */
+  settlement?: {
+    settled: number;
+    /** Changes to settled bills, made by evidence that arrived after settlement. */
+    corrections: number;
+    correctedSessions: number;
+    correctionsWh: number;
+  };
   /** Times a charger's connection broke under it (a gateway crashed) and it reconnected. */
   reconnects: number;
   /** The faults that actually happened: a run that injected none would prove nothing. */
@@ -137,10 +147,15 @@ export interface BillingReport {
  * Compares every simulated session with the database (D-010): it must exist exactly once, under
  * the transactionId the charger was given, billed exactly its evidenced energy, with every reading
  * the charger sent stored exactly once.
+ *
+ * With `settled`, every session must also have settled, and its settled bill plus its corrections
+ * must add up to that same bill. A correction is only allowed where a reading came after the stop
+ * (D-034).
  */
 export async function checkBilling(
   db: Queryable,
   sessions: readonly SessionTruth[],
+  options: { settled?: boolean } = {},
 ): Promise<BillingReport> {
   const chargePointIds = [...new Set(sessions.map((session) => session.chargePointId))];
   const { rows } = await db.query<{
@@ -151,15 +166,24 @@ export async function checkBilling(
     meter_start_wh: number;
     energy_wh: number | null;
     state: string;
+    needs_review: boolean;
+    settled_energy_wh: number | null;
     readings: number | null;
+    corrections: number;
+    corrections_wh: number;
   }>(
     `SELECT t.transaction_id, t.charge_point_id, t.connector_id, t.started_at, t.meter_start_wh,
-            t.energy_wh, t.state, r.readings
+            t.energy_wh, t.state, t.needs_review, t.settled_energy_wh, r.readings,
+            coalesce(c.corrections, 0) AS corrections, coalesce(c.corrections_wh, 0) AS corrections_wh
        FROM transactions t
        LEFT JOIN (SELECT transaction_id, count(*)::int AS readings
                     FROM meter_readings
                    WHERE charge_point_id = ANY($1)
                    GROUP BY transaction_id) r USING (transaction_id)
+       LEFT JOIN (SELECT transaction_id, count(*)::int AS corrections,
+                         sum(delta_wh)::bigint AS corrections_wh
+                    FROM bill_corrections
+                   GROUP BY transaction_id) c USING (transaction_id)
       WHERE t.charge_point_id = ANY($1)`,
     [chargePointIds],
   );
@@ -191,6 +215,9 @@ export async function checkBilling(
       lostResponses: 0,
       droppedAfterSend: 0,
     },
+    ...(options.settled && {
+      settlement: { settled: 0, corrections: 0, correctedSessions: 0, correctionsWh: 0 },
+    }),
   };
   const matched = new Set<number>();
 
@@ -214,7 +241,30 @@ export async function checkBilling(
         report.discrepancies += 1;
         problems.push(`billed ${String(row.energy_wh)} Wh, evidenced ${truth.evidencedWh} Wh`);
       }
-      if (row.state !== 'stopped') problems.push(`state is ${row.state}`);
+      const { settlement } = report;
+      if (!settlement) {
+        if (row.state !== 'stopped') problems.push(`state is ${row.state}`);
+      } else if (row.state !== 'settled') {
+        problems.push(`state is ${row.state}, not settled`);
+      } else {
+        settlement.settled += 1;
+        const invoicedWh = (row.settled_energy_wh ?? 0) + row.corrections_wh;
+        if (invoicedWh !== row.energy_wh) {
+          problems.push(
+            `settled ${String(row.settled_energy_wh)} Wh plus corrections ${row.corrections_wh} Wh ` +
+              `is not the bill of ${String(row.energy_wh)} Wh`,
+          );
+        }
+      }
+      if (settlement && row.corrections > 0) {
+        settlement.corrections += row.corrections;
+        settlement.correctedSessions += 1;
+        settlement.correctionsWh += row.corrections_wh;
+        if (truth.faults.readingsAfterStop === 0) {
+          problems.push('corrected, but no reading came after the stop');
+        }
+      }
+      if (row.needs_review) problems.push('flagged for review');
       if (row.readings !== truth.samplesSent) {
         problems.push(`${String(row.readings)} readings stored, ${truth.samplesSent} sent`);
       }
@@ -247,6 +297,33 @@ export async function checkBilling(
   }
   report.invented = rows.filter((row) => !matched.has(row.transaction_id)).length;
   return report;
+}
+
+/**
+ * Settles sessions in the background while the chargers run, as `pnpm settle` would (D-034).
+ * A short quiet period settles some sessions before all their evidence is in, which is how
+ * corrections get exercised.
+ */
+export function startSettler(db: Pool, options: { quietMs: number; everyMs: number }) {
+  let running = true;
+  let settled = 0;
+  const loop = (async () => {
+    while (running) {
+      settled += await settleDueSessions(db, { quietMs: options.quietMs });
+      await sleep(options.everyMs);
+    }
+  })();
+  return {
+    /**
+     * Stops the background passes. Call it once every charger has finished: one last pass then
+     * settles whatever is left.
+     */
+    async stop(): Promise<{ whileRunning: number; atTheEnd: number }> {
+      running = false;
+      await loop;
+      return { whileRunning: settled, atTheEnd: await settleDueSessions(db, { quietMs: 0 }) };
+    },
+  };
 }
 
 /**
