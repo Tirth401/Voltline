@@ -1,0 +1,46 @@
+# The identity of the simulator Jobs that `pnpm kind:faults` and `pnpm kind:storm` start inside the
+# cluster. Its chaos driver may find, delete and SIGKILL pods in this namespace, and read how many
+# gateways the Deployment wants. Nothing else.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: simulator
+  namespace: voltline
+  labels:
+    app.kubernetes.io/part-of: voltline
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: simulator
+  namespace: voltline
+  labels:
+    app.kubernetes.io/part-of: voltline
+rules:
+  - apiGroups: ['']
+    resources: ['pods']
+    verbs: ['get', 'list', 'delete']
+  # To wait until every gateway the Deployment wants is back before and after a run.
+  - apiGroups: ['apps']
+    resources: ['deployments']
+    verbs: ['get']
+  # exec runs `kill -KILL -1` inside a gateway container: a crash with no chance to clean up.
+  - apiGroups: ['']
+    resources: ['pods/exec']
+    verbs: ['get', 'create']
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: simulator
+  namespace: voltline
+  labels:
+    app.kubernetes.io/part-of: voltline
+subjects:
+  - kind: ServiceAccount
+    name: simulator
+    namespace: voltline
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: simulator

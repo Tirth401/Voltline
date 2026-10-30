@@ -12,7 +12,7 @@ isn't done until its exit check passes. Design reasoning lives in [DECISIONS.md]
 - [x] `pnpm prereqs` checks this machine's prerequisites
 - [x] OCPP 1.6 JSON schemas copied into `packages/ocpp/schemas/v1.6/`, byte-identical to the OCA download
 
-## M1 · Weeks 1–2 · One charger, one session, end to end (done, except the kind trial)
+## M1 · Weeks 1–2 · One charger, one session, end to end (done)
 
 **Exit check:** a simulated charger boots, authorizes, charges and stops; the stored energy equals
 the simulator's ground truth; resending StartTransaction returns the same transactionId;
@@ -25,7 +25,7 @@ the simulator's ground truth; resending StartTransaction returns the same transa
 - [x] `availability`: connector status in Redis, newest timestamp wins
 - [x] `simulator`: one well-behaved, seeded charger recording physical and evidenced energy
 - [x] End-to-end test of a full session, plus `pnpm smoke` through the real gateway process and simulator CLI
-- [ ] kind trial run: 2,000 WebSocket connections into one pod from a Job inside the cluster
+- [x] kind trial run: 2,000 WebSocket connections into one pod from a Job inside the cluster (done in M4: [results](results/m4-kind-trial-and-rebalancing.md))
 
 **Known gaps found in M1, both fixed in M2:** a StopTransaction for an unknown session was
 acknowledged but not stored (the frame log now keeps it), and readings that arrived after their
@@ -87,26 +87,42 @@ chargers through a reconnect storm.
 - [x] Settlement and late-evidence corrections: a bill settles once its evidence goes quiet, and later evidence becomes a correction (D-034, [results](results/m3-settlement-corrections.md))
 - [x] Simulator at 2,000 concurrent chargers: idle chargers that measure their own reconnects, `pnpm storm`, and a no-jitter baseline (D-035)
 
-## M4 · Weeks 7–8 · Kubernetes
+## M4 · Weeks 7–8 · Kubernetes (done)
 
 **Exit check:** one script brings the whole system up in kind, and result 1 reproduces there with
 real pod kills.
 
-- [ ] Docker images, kind config, manifests (gateway ×3, api, controller with `strategy: Recreate`, Postgres and Redis StatefulSets)
-- [ ] Readiness and liveness probes, preStop hook, connections closed gradually at shutdown
-- [ ] BootNotification rate limiting: Redis token bucket, answering `Pending` with an `interval` when over budget
-- [ ] Simulator as a Job inside the cluster; chaos driver that kills pods on a seeded schedule
-- [ ] **Result 1** write-up
-- [ ] **Result 2** again in kind: the same 1,000 load changes with the controller and gateway pods killed (done outside Kubernetes in M3, with controller restarts, refused and lost changes, and usefulness: [results](results/m3-smart-charging-cap.md))
+**Done.** `pnpm kind:up` brings the whole system up in kind, and result 1 reproduced there: six runs
+of 5,000 sessions with gateway pods killed in three ways, each with 0 discrepancies, 0 lost,
+0 invented and 0 replay mismatches ([results](results/m4-billing-with-pod-kills.md)). The first
+batch of those runs failed twice and found a simulator bug; that batch is reported too.
+
+- [x] Docker images, kind config, manifests: one image for every process, gateway ×3, api,
+      controller with `strategy: Recreate`, settlement as a CronJob, Postgres and Redis StatefulSets,
+      migrations as a Job (D-036)
+- [x] Readiness and liveness probes, preStop hook, connections closed gradually at shutdown (D-037)
+- [x] BootNotification rate limiting: a Redis token bucket shared by all gateways, answering
+      `Pending` with each charger's own appointment (D-038)
+- [x] Simulator as a Job inside the cluster; chaos driver that kills pods on a seeded schedule, in
+      three ways: crash, delete, drain (D-040)
+- [x] **Result 1** write-up ([results](results/m4-billing-with-pod-kills.md))
+- [x] The kind trial left over from M1: 2,000 chargers into one pod
+      ([results](results/m4-kind-trial-and-rebalancing.md))
+- [x] Connection rebalancing after a gateway restart, found missing in M3 (D-039,
+      [results](results/m4-kind-trial-and-rebalancing.md))
+- Moved to M5, which already plans "smart charging under chaos": **result 2** in kind, with the
+  controller and gateway pods killed. In M3 it ran outside Kubernetes, with controller restarts,
+  refused and lost changes ([results](results/m3-smart-charging-cap.md)).
 
 ## M5 · Weeks 9–10 · Reconnect storm and interoperability
 
 **Exit check:** result 3 measured in three scenarios over several runs, with every run reported;
 SAP's simulator completes a session and accepts a SetChargingProfile.
 
-- [ ] **Result 3:** kill 1 of 3 gateway pods, rolling restart, and all pods down (already measured with processes on one laptop in M3: [results](results/m3-reconnect-storm.md)). Measured from the chargers' side: time to reconnect and to the first accepted message (p50/p95/p99/max), attempts, Pending boots, and how unevenly connections spread across pods. Includes a baseline without jitter or rate limiting. Never through `kubectl port-forward`.
+- [ ] **Result 3:** kill 1 of 3 gateway pods, rolling restart, and all pods down (already measured with processes on one laptop in M3: [results](results/m3-reconnect-storm.md)). Measured from the chargers' side: time to reconnect and to the first accepted message (p50/p95/p99/max), attempts, Pending boots, and how unevenly connections spread across pods. Includes a baseline without jitter or rate limiting. Never through `kubectl port-forward`. The tools exist since M4 (`pnpm kind:storm`, D-040), and single runs of each kill mode are in [results](results/m4-kind-trial-and-rebalancing.md).
+- [ ] Idle chargers that notice a dead connection by themselves (WebSocket pings or Heartbeats), so a connection that dies silently is counted honestly
 - [ ] Interop with SAP's e-mobility charging station simulator; every incompatibility logged in DECISIONS.md
-- [ ] Smart charging under chaos (controller and gateway pods killed mid-change)
+- [ ] Smart charging under chaos (controller and gateway pods killed mid-change): **result 2** in kind, moved from M4
 
 ## M6 · Weeks 11–12 · Buffer and write-up
 

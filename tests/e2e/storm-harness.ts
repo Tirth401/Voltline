@@ -157,7 +157,7 @@ export async function runStorm(options: StormOptions): Promise<StormReport> {
 }
 
 /** Nearest-rank percentiles. Infinity stands for a charger that never made it. */
-function percentiles(values: readonly number[]): Percentiles {
+export function percentiles(values: readonly number[]): Percentiles {
   const sorted = values.toSorted((a, b) => a - b);
   const at = (p: number) => sorted[Math.max(0, Math.ceil((p / 100) * sorted.length) - 1)] ?? 0;
   return { p50: at(50), p95: at(95), p99: at(99), max: sorted.at(-1) ?? 0 };

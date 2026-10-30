@@ -111,7 +111,7 @@ checks.push(
     : {
         level: 'later',
         name: 'kind',
-        detail: 'not installed (needed for the week-2 trial run)',
+        detail: 'not installed (needed for pnpm kind:up, Kubernetes on this laptop)',
         fix: 'brew install kind',
       },
 );
@@ -123,7 +123,7 @@ checks.push(
     : {
         level: 'later',
         name: 'kubectl',
-        detail: 'not installed (needed with kind)',
+        detail: 'not installed (needed with kind; ideally the same minor version as the cluster)',
         fix: 'brew install kubectl',
       },
 );

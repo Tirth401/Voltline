@@ -5,10 +5,14 @@ chargers using OCPP 1.6J over WebSockets. It rebuilds the hard core of a real ch
 billing that stays exact when chargers misbehave, site power caps that are never exceeded, and
 fast recovery when the gateway restarts.
 
-> **Status:** Milestone 3 is done. Kubernetes (Milestone 4) is next.
+> **Status:** Milestone 4 is done: the whole system runs in Kubernetes (kind) with one command.
+> The reconnect-storm result and interoperability (Milestone 5) are next.
 >
-> - **Billing under crashes:** 5,000 seeded sessions full of faults are billed to the watt-hour
->   while three gateway processes are killed with SIGKILL as they run (three seeds out of three).
+> - **Billing under pod kills:** 5,000 seeded sessions full of faults are billed to the watt-hour
+>   inside Kubernetes while gateway pods are crashed, deleted and drained as they run (six final
+>   runs out of six; the first batch found a simulator bug, and is reported too).
+> - **Kubernetes:** `pnpm kind:up` brings everything up. Gateways drain gradually when stopped,
+>   share a budget for BootNotifications, and rebalance their connections after a restart.
 > - **Commands:** commands reach a charger through whichever gateway holds its connection.
 > - **Smart charging:** a controller keeps each site under its power cap. Over 1,000 load changes,
 >   with chargers refusing limits, losing answers and dropping offline, and the controller
@@ -17,7 +21,7 @@ fast recovery when the gateway restarts.
 > - **Settlement:** a bill becomes final once its evidence goes quiet; evidence after that becomes
 >   a correction, never a silent edit. Checked while gateways are being killed.
 > - **Reconnect storms:** 2,000 simulated chargers all come back after one gateway, or all three,
->   are killed, measured from the chargers' side.
+>   are killed, measured from the chargers' side: as processes, and now as pods in Kubernetes.
 >
 > See [docs/ROADMAP.md](docs/ROADMAP.md). To learn how it was built, start with
 > [docs/BUILD_JOURNAL.md](docs/BUILD_JOURNAL.md).
@@ -28,16 +32,20 @@ Each result gets a write-up in `docs/results/` with the exact command, seed, dat
 
 1. **Billing:** zero discrepancies across 5,000 simulated sessions with injected faults (offline
    periods, duplicate messages, out-of-order meter values, meter resets, gateway pod kills).
-   _So far: 5,000 sessions with gateway processes killed mid-run, three seeds, zero
-   discrepancies ([write-up](docs/results/m3-billing-with-gateway-kills.md)). Pod kills in
-   Kubernetes come next._
+   _Done: 5,000 sessions inside Kubernetes with gateway pods crashed, deleted and drained, six
+   runs, zero discrepancies ([write-up](docs/results/m4-billing-with-pod-kills.md)). Before that,
+   with processes ([write-up](docs/results/m3-billing-with-gateway-kills.md))._
 2. **Smart charging:** no site exceeds its power cap across 1,000 simulated load changes.
    _So far: 1,000 load changes with charger faults and controller restarts, outside Kubernetes;
-   the cap held in every run ([write-up](docs/results/m3-smart-charging-cap.md))._
+   the cap held in every run ([write-up](docs/results/m3-smart-charging-cap.md)). In Kubernetes,
+   with pods killed: Milestone 5._
 3. **Recovery:** 2,000 simulated chargers reconnect after a gateway pod restart in Kubernetes
    (kind), measured from the chargers' side.
-   _So far: with gateway processes on one laptop, every charger came back in every run
-   ([write-up](docs/results/m3-reconnect-storm.md)). Kubernetes comes in Milestone 5._
+   _So far: with gateway processes, every charger came back in every run
+   ([write-up](docs/results/m3-reconnect-storm.md)). In Kubernetes, single runs of each way of
+   killing a pod all recovered, and the gateways rebalanced
+   ([write-up](docs/results/m4-kind-trial-and-rebalancing.md)). The measured result, with several
+   runs per scenario, comes in Milestone 5._
 
 ## Prerequisites
 
@@ -47,7 +55,7 @@ Each result gets a write-up in `docs/results/` with the exact command, seed, dat
 | pnpm                  | installs and runs the workspace              | `brew install pnpm`                                                                                         |
 | Docker Desktop        | Postgres and Redis for development and tests | https://www.docker.com/products/docker-desktop/                                                             |
 | OCPP 1.6 JSON schemas | message validation                           | Open Charge Alliance; steps in [packages/ocpp/schemas/v1.6/README.md](packages/ocpp/schemas/v1.6/README.md) |
-| kind                  | local Kubernetes (trial run in week 2)       | `brew install kind`                                                                                         |
+| kind                  | local Kubernetes (`pnpm kind:up`)            | `brew install kind`                                                                                         |
 | kubectl               | talks to kind                                | `brew install kubectl`                                                                                      |
 
 `node scripts/prereqs.ts` checks all of these, works before anything is installed, and says what's
@@ -129,6 +137,38 @@ measures how long it took to be accepted again, and the run checks that the char
 the outage are exactly the ones the registry had on the killed gateways (D-035). Add `--no-jitter`
 for the baseline where every charger backs off in step.
 
+## Kubernetes (kind)
+
+```bash
+pnpm kind:up
+pnpm kind:faults --sessions 5000 --chargers 100 --chaos --seed 1
+pnpm kind:storm --chargers 2000 --gateways 1 --kill none --hold 30000 --seed 1
+pnpm kind:storm --chargers 2000 --kill one --kill-mode crash --hold 15000 --seed 1
+pnpm kind:down
+```
+
+`pnpm kind:up` brings the whole system up in a local Kubernetes cluster: it creates the kind
+cluster if needed, builds one image for every service (`deploy/Dockerfile`), loads the images, starts
+Postgres and Redis, runs the migrations, starts three gateways, the API, the charging controller and
+the settlement CronJob (`deploy/k8s/`), and waits until all are ready (D-036). It is safe to run
+again; the services restart only when the image changed.
+
+`pnpm kind:faults` and `pnpm kind:storm` run the same harnesses as `pnpm faults` and `pnpm storm`,
+but as a Job inside the cluster: the chargers reach the gateways through their Service, and
+`--chaos` (or `--kill`) kills real gateway pods: SIGKILL inside the container, a pod deleted at
+once, or a pod drained as a deploy would (D-040). The report is saved under `.runs/` on the laptop.
+Measurements never go through `kubectl port-forward`. `--gateways N` (storms only) runs with N
+gateway pods, then scales back to 3.
+
+The gateways drain their connections gradually when stopped (D-037), answer BootNotification
+`Pending` with an appointment when the cluster's boot budget is spent (D-038), and rebalance their
+connections after one restarts (D-039).
+
+To try it by hand: `curl http://localhost:19230/chargers/CP-DEMO-1` reaches the API, and
+`pnpm sim --url ws://localhost:19220/ocpp --charger CP-DEMO-1 --tag TAG-DEMO-1` runs one session
+through the gateways. If your `kubectl` is far older than the cluster (Docker Desktop ships its own),
+set `KUBECTL=/path/to/kubectl`.
+
 ## Running it by hand
 
 ```bash
@@ -178,10 +218,9 @@ voltline/
 │   └── settlement/           settles stopped sessions once their evidence goes quiet
 ├── simulator/                seeded chargers that misbehave and record their own ground truth
 ├── tests/e2e/                end-to-end tests and harnesses: pnpm faults / cap / storm / replay
-└── scripts/                  prereqs.ts (machine check), smoke.ts (run it for real)
+├── deploy/                   Dockerfile, the kind cluster config, and the Kubernetes manifests
+└── scripts/                  prereqs.ts (machine check), smoke.ts (run it for real), kind/ (pnpm kind:*)
 ```
-
-Added when Milestone 4 needs it: `deploy/`.
 
 ## Conventions
 

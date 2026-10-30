@@ -1,0 +1,18 @@
+# The local Kubernetes cluster: one kind node that runs both the control plane and Voltline.
+# Created by `pnpm kind:up`. The node image is pinned by digest (D-015): it is the default image
+# of kind 0.33.0, Kubernetes 1.37.0.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: voltline
+nodes:
+  - role: control-plane
+    image: kindest/node:v1.37.0@sha256:a1ed56cfb0e7b93589bdf97c8cd566405a265939e3620fc4f5de89adff580ae5
+    # Two NodePorts reachable from the laptop, for trying the system by hand. Measurements never
+    # go through these: the simulator runs as a Job inside the cluster.
+    extraPortMappings:
+      - containerPort: 30220 # gateway: ws://localhost:19220/ocpp/{chargePointId}
+        hostPort: 19220
+        listenAddress: 127.0.0.1
+      - containerPort: 30230 # api: http://localhost:19230
+        hostPort: 19230
+        listenAddress: 127.0.0.1

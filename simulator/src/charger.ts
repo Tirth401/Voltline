@@ -69,6 +69,8 @@ export interface SessionTruth {
     droppedAfterSend: number;
     /** Times the connection broke under the charger (a gateway crashed) and it reconnected. */
     reconnects: number;
+    /** BootNotifications answered Pending before this session (only a charger's first session can have any). */
+    pendingBoots: number;
   };
   /** The exact payloads sent, so tests can resend them. */
   startRequest: V16Request<'StartTransaction'>;
@@ -118,7 +120,7 @@ export class SimulatedCharger {
   #online = true;
   #outbox: Queued[] = [];
   #status: ConnectorStatus = 'Available';
-  readonly #counts = { lostResponses: 0, droppedAfterSend: 0, reconnects: 0 };
+  readonly #counts = { lostResponses: 0, droppedAfterSend: 0, reconnects: 0, pendingBoots: 0 };
   #sessionCount = 0;
   // Remote mode (D-030): commands from the CSMS start and stop sessions.
   #serving = false;
@@ -183,11 +185,26 @@ export class SimulatedCharger {
   }
 
   async #boot(): Promise<void> {
-    const boot = (await this.#send('BootNotification', {
+    const request = {
       chargePointVendor: 'Voltline',
       chargePointModel: 'SimCharger',
       firmwareVersion: '0.1.0',
-    })) as { status: string };
+    };
+    let boot = (await this.#send('BootNotification', request)) as {
+      status: string;
+      interval: number;
+    };
+    // Pending: OCPP 1.6 says to boot again after `interval` seconds and to send nothing else
+    // meanwhile. How often that happens depends on timing, so these retries draw nothing from the
+    // seeded stream (D-028): the charger's own behaviour stays exactly as the seed says.
+    while (boot.status === 'Pending') {
+      this.#counts.pendingBoots += 1;
+      await sleep(Math.max(1, boot.interval) * 1_000);
+      boot = (await this.#deliver('BootNotification', request, 'wait for the answer')) as {
+        status: string;
+        interval: number;
+      };
+    }
     if (boot.status !== 'Accepted') throw new Error(`BootNotification was ${boot.status}`);
     await this.#send('Heartbeat', {});
     await this.#reportStatus(0, 'Available');
@@ -425,6 +442,7 @@ export class SimulatedCharger {
         lostResponses: this.#counts.lostResponses - countsBefore.lostResponses,
         droppedAfterSend: this.#counts.droppedAfterSend - countsBefore.droppedAfterSend,
         reconnects: this.#counts.reconnects - countsBefore.reconnects,
+        pendingBoots: index === 0 ? this.#counts.pendingBoots : 0,
       },
       startRequest,
       meterValuesRequests,
@@ -560,8 +578,10 @@ export class SimulatedCharger {
           },
         );
       } catch (error) {
-        // An HTTP refusal (unknown charger, wrong subprotocol) won't fix itself by retrying.
-        if (error instanceof ConnectionRefusedError) throw error;
+        // An HTTP refusal (unknown charger, wrong subprotocol) won't fix itself by retrying. A 503
+        // will: that gateway is shutting down (D-037) or holds more than its share (D-039), and
+        // the next try may well reach another one.
+        if (error instanceof ConnectionRefusedError && error.statusCode !== 503) throw error;
         if (failures >= MAX_CONNECT_FAILURES) {
           throw new Error(`no gateway accepted a connection in ${failures + 1} tries`, {
             cause: error,

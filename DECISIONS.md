@@ -695,3 +695,267 @@ with BootNotification rate limiting in Milestone 4.
   outage takes longer, by about one cap.
 - Connections don't rebalance after a restart: a gateway that comes back late stays almost empty.
   That needs a rebalancing rule in Milestone 4 or later.
+
+## D-036 · Voltline in Kubernetes: one image, a kind cluster, and one script to bring it up
+
+_2026-10-30_
+
+**Decision.** `pnpm kind:up` brings the whole system up in a local Kubernetes cluster (kind). It
+creates the cluster if it doesn't exist, builds the image, loads every image into the cluster,
+starts Postgres and Redis, runs the migrations, starts the services, and waits until each one is
+ready. It is safe to run again. From no cluster at all to everything ready took 72 seconds on this
+laptop.
+
+- **One image for every process** (`deploy/Dockerfile`). Node runs the TypeScript sources directly
+  (D-003), so the image holds the sources and the production dependencies, not a build output:
+  238 MB. Each Deployment picks its program with its command. The base image is pinned by version
+  and digest (D-015).
+- **tini is process 1** in every container. It passes SIGTERM on to Node and cleans up dead child
+  processes. It also lets the chaos driver SIGKILL Node from inside the container (D-040): the
+  kernel ignores SIGKILL sent to a namespace's process 1 from inside that namespace.
+- **The cluster** is one kind node that runs the control plane and Voltline, Kubernetes 1.37.0,
+  with the node image pinned by digest. Two NodePorts (19220 for chargers, 19230 for the API) are
+  open on the laptop for trying things by hand; measurements never use them.
+- **What runs** (`deploy/k8s/`):
+  - Postgres (the same pinned TimescaleDB image as docker-compose) and Redis: one replica each, as
+    StatefulSets with their own disks;
+  - the gateways: a Deployment of three behind one Service. A rolling update adds a new pod before
+    it removes an old one;
+  - the API: a Deployment;
+  - the charging controller: exactly one replica with `strategy: Recreate`, so a new version starts
+    only after the old one has stopped (D-032);
+  - settlement: a CronJob that runs `--once` every minute (D-034);
+  - the migrations and the demo seed: a Job that `kind:up` runs before the services start.
+- **Probes.** A gateway is ready when it is listening and not shutting down, and alive while its
+  event loop answers. The controller is alive while its loop keeps coming round, even if its ticks
+  fail. Nothing runs as root, root file systems are read-only, and every Linux capability is
+  dropped.
+- **Images go into the cluster as one-platform archives** (`docker save --platform`, then
+  `kind load image-archive`). The image tag stays `voltline:dev`, so the script stamps the image's
+  id on the pod templates: pods restart exactly when the image changed.
+
+**Why.**
+
+- **One image** keeps the services in step: they always run the same version of the shared
+  packages.
+- **Migrations as a Job, not in every pod.** The migrator's advisory lock (D-012) would make it safe
+  to run in every pod at start-up, but that would add half a second to every gateway start, and how
+  fast a gateway pod comes back is exactly what result 3 measures.
+- **The gateway's readiness ignores Postgres and Redis on purpose.** If either went down, every
+  gateway would become unready at the same moment and the Service would have nowhere to send
+  chargers: a full outage, even for messages that could still be handled.
+- **Why the archives.** Docker Desktop's image store lists every platform of a multi-platform image
+  but keeps only this machine's. `kind load docker-image` then fails on the missing ones: it did,
+  for TimescaleDB, with "content digest not found".
+
+**Known limits.**
+
+- One node: no node failures, and everything shares one laptop. Postgres and Redis have one replica
+  each; making the database highly available is out of scope.
+- The `kubectl` on this machine comes with Docker Desktop: version 1.34, three minor versions older
+  than the cluster (Kubernetes only promises one). Everything here worked with it; the script warns,
+  and `KUBECTL=/path/to/kubectl` picks another one.
+- The database password is in a manifest, as in docker-compose. A real deployment would take it from
+  a secret manager.
+
+## D-037 · A gateway shuts down gently: readiness, a preStop pause, and a gradual drain
+
+_2026-10-30_
+
+**Decision.** When a gateway pod is deleted (a deploy, a scale-down, a node drain):
+
+1. Kubernetes takes it out of the Service and starts its preStop hook at the same moment. The hook
+   is a 5-second pause, so every node has stopped sending it new connections before it does
+   anything.
+2. Then SIGTERM. The gateway reports itself not ready, leaves the load board (D-039), and turns
+   any new charger away with HTTP 503. Leaving the board talks to Redis, so it gets at most a
+   second: if Redis is down, it must not hold up the drain.
+3. It closes its connections one by one, spread evenly over `SHUTDOWN_DRAIN_MS` (10 s in the
+   manifest), with WebSocket close code 1001 ("going away"). It keeps listening meanwhile, so a
+   charger that arrives late gets a clear 503 rather than a refused connection.
+4. Once the last connection is closed, it flushes the frame log and exits. The grace period is
+   30 s: more than 5 + 10 s plus the flush.
+
+**Why.** A gateway holding 700 chargers that closed them all at once would send 700 reconnects at
+the other gateways in the same instant: a storm we caused ourselves. Spread over ten seconds, it is
+70 a second. The pause comes first because removing a pod from the Service takes a moment to reach
+every node; without it, new chargers could still arrive at a gateway that is already closing.
+
+**Found while building.** The first version stopped listening the moment SIGTERM arrived. The test
+showed that a charger arriving during the drain then got a refused connection instead of a 503,
+and that `/readyz` couldn't even answer "draining". Now the gateway stops listening last.
+
+**How it is checked.** An integration test opens 19 connections and starts a 900 ms drain: the
+gateway is unready at once, a new charger gets 503, and the 19 connections close about every 50 ms,
+not all at once.
+
+**Known limits.**
+
+- A pod deleted with no grace period gets only the kubelet's minimum of about 2 seconds, so most
+  of its connections are cut, not drained. In one storm run, 128 of 702 connections were drained
+  (code 1001) and 540 were cut when SIGKILL came (1006) ([results](docs/results/m4-kind-trial-and-rebalancing.md)).
+- The drain doesn't wait for a quiet moment on each connection. A message the gateway was still
+  answering gets no answer, and the charger sends it again, which billing absorbs (D-005).
+- A drained gateway's chargers move twice: to the other gateways, then partly back to the new pod
+  when rebalancing (D-039) evens things out.
+
+## D-038 · A cluster-wide budget for BootNotifications, with appointments
+
+_2026-10-30_
+
+**Decision.** All gateways share one budget for BootNotifications, kept in Redis: 500 a second,
+and up to 500 at once after a quiet spell (`BOOT_RATE_PER_S`, `BOOT_BURST`). Over budget, a
+gateway answers `Pending` with an `interval` and writes nothing. OCPP 1.6 says the charger must then
+wait that many seconds, send nothing else, and boot again on the same connection.
+
+- **The interval is an appointment.** The budget is a token bucket stored as one number, the
+  "theoretical arrival time" (the GCRA algorithm). A charger that is turned away gets the next free
+  place: the budget books it under its own key, and tells it how long until then. When it comes
+  back for its appointment, it is let in without paying a second time. If it comes back early, it
+  keeps its place.
+- **One clock.** The Lua script uses Redis's own time, so gateways never disagree about it.
+- **If Redis can't answer, the boot is accepted.** The budget protects the database; it isn't worth
+  turning chargers away for.
+- **Only BootNotification is limited.** Messages a charger sends anyway, before it has been
+  accepted, are still handled: transaction messages are never refused (D-008).
+- **The simulated chargers obey Pending.** The billing chargers' extra boots draw nothing from
+  their seeded stream (D-028), so a seed means the same faults whether or not they had to wait. A
+  test checks it: the same seed with and without a tight budget gives identical faults and energy.
+
+**Why.**
+
+- **After an outage, every charger boots within seconds,** and each boot is a database write.
+  Boots are the least urgent message in a storm; the billing messages that arrive with them matter
+  more.
+- **Why appointments, not one "come back later" for everyone.** If every charger turned away is told
+  "5 seconds", they all come back together 5 seconds later: the same storm, postponed. With an
+  appointment each, they come back spread out at the budget's rate.
+- **Why 500 a second.** It is about a third of what one gateway pod took in the kind trial (2,000
+  boots in 1.4 s), so ordinary traffic never notices it, and a mass reconnect leaves room for the
+  billing messages. It is a starting point, not a measured optimum: Milestone 5 measures the
+  trade-off.
+
+**How it is checked.** Integration tests against real Redis, with an explicit clock: a burst is let
+in at once and the rest get appointments 100 ms apart; a charger that comes back on time is let in
+without taking a new place; one that comes back early keeps its place. A property test plays random
+arrivals against random budgets: every charger is let in in the end, a charger that comes back as
+told is never turned away twice, and by any moment no more than the burst plus the rate times the
+time elapsed have been let in.
+
+**Known limits.**
+
+- OCPP's interval is whole seconds. A charger whose appointment is 0.1 s away waits a full second,
+  and the chargers whose appointments fall in the same second come back together: at most a
+  second's worth of the budget at once.
+- A charger that never comes back wastes its place: some capacity, never safety. Appointments
+  expire after a minute.
+- A cold start is slower with the budget. In the 15 storm runs with it on, 2,000 chargers starting
+  at once were all accepted within 3.5 to 5.2 s, and 1,447 to 1,489 of their boots were answered
+  Pending; without it, one pod took them all in 1.4 s
+  ([results](docs/results/m4-kind-trial-and-rebalancing.md)).
+
+## D-039 · Gateways rebalance their connections after a restart
+
+_2026-10-30_
+
+**Decision.** Every second, each gateway writes how many chargers it holds to a "load board" in
+Redis, and reads everyone else's. A gateway that hasn't written for three seconds is forgotten; one
+that is shutting down removes itself.
+
+- **The fair share** is all the chargers divided by the number of gateways.
+- **When to start.** A gateway starts shedding once it has been over its fair share by more than a
+  slack (the larger of 50 chargers and 10%) for three rounds in a row, and only if some other
+  gateway is below the fair share, so the chargers have somewhere better to go.
+- **How.** It closes up to 50 connections a round, spread across the round, with close code 1013,
+  until it is down to the fair share. While it sheds, it turns new chargers away with 503, so the
+  Service's random pick lands them on a gateway with room.
+- **Chargers in transit.** While a gateway is shedding, its estimate of the total never goes down:
+  chargers on their way between gateways are in nobody's count for a moment.
+
+**Why.** The Service gives each new connection to a random ready pod. After a restart, nothing
+makes chargers move, so the restarted gateway stays almost empty: in the Milestone 3 storms, one
+ended with 3 chargers while the others had about 1,000 each (D-035). Better load balancing
+(least-connections) would need another proxy in front of the gateways, and OCPP has no way to
+redirect a charger. Shedding plus turning chargers away is least-connections built into the
+gateways themselves.
+
+**Found while building**, each by a test or by the storm cross-check:
+
+1. **It shed too many.** In the integration test the busy gateway let 23 chargers go, where 20
+   was right, and the other gateway then sent 3 back. The cause: chargers in transit are in nobody's
+   count, so the total looked smaller and the fair share too low. Taking the larger of this round's
+   and last round's total wasn't enough, because chargers are in transit for as long as shedding
+   lasts. Now the estimate doesn't drop while shedding, and exactly 20 move.
+2. **It moved chargers during a cold start.** Early in a cold start the counts are uneven by chance,
+   and rebalancing moved chargers that had only just arrived. One charger opened 10 connections
+   before it settled. A storm run found it: two chargers on a killed pod "never noticed" the kill,
+   because rebalancing had moved them a moment before. So now the imbalance must last three rounds.
+
+**How it is checked.** The decision is a pure function. Unit tests cover each rule; a property test
+checks that a gateway never sheds below the fair share, never more than a round allows, never
+without somewhere to go, and never before its patience is up; a seeded simulation moves 2,000
+chargers onto a restarted gateway and checks that exactly the 666 surplus chargers move. An
+integration test with two real gateways checks that 40 chargers end up 20 and 20, with 20 moved, and
+stay there. In kind, after one gateway pod was killed, the three pods ended within the slack.
+
+**Known limits.**
+
+- Even only to within the slack, on purpose: about ±10% at 2,000 chargers.
+- Each charger moved costs a reconnect, and a BootNotification if it boots on every connection.
+- At 50 a round, moving about 650 chargers onto a restarted gateway takes about 10 seconds.
+- Each gateway sees the others' counts up to a round late.
+
+## D-040 · Measurements run inside the cluster, with three ways to kill a pod
+
+_2026-10-30_
+
+**Decision.** `pnpm kind:faults` and `pnpm kind:storm` start the simulator as a Job inside the
+cluster. It is the same harness code as Milestones 2 and 3, with `--target kubernetes`. The
+chargers connect through the gateway Service like any client inside the cluster. Nothing is ever
+measured through `kubectl port-forward`.
+
+- **The chaos driver runs in the same process.** It talks to the Kubernetes API with the Job's own
+  service account. Its Role allows exactly this: list, get and delete pods, exec into them, and
+  read how many gateways the Deployment wants.
+- **Three ways to kill a gateway pod.** For each kill, the seed picks one at random:
+  - **crash:** `kill -KILL -1` inside the container. Node dies with no chance to clean up, like the
+    process kills of Milestone 3 (D-029) or an out-of-memory kill. The kubelet restarts the
+    container in the same pod. If the same pod crashes again soon, Kubernetes waits longer before
+    each restart (CrashLoopBackOff);
+  - **delete:** the pod is deleted with no grace period. It vanishes from the API at once and a new
+    pod replaces it. What chaos tools call a pod kill;
+  - **drain:** the pod is deleted politely, as a deploy would: pause, SIGTERM, ten seconds of
+    draining (D-037).
+- **The rule from D-029 still holds:** a kill only happens while at least two gateways are ready.
+- **Every run starts from a clean slate.** The cluster's database is shared, so a run first deletes
+  everything its chargers ever did, then registers them, then waits until every gateway pod is
+  ready. It uses the same charger names as Milestone 3, so a seed means the same chargers doing the
+  same things. Afterwards it waits until Kubernetes has every gateway back. A run that passes
+  deletes its data; a run that fails keeps it until the next run.
+- **The report goes to the Job's log** between two marker lines. The script on the laptop cuts it
+  out and saves it under `.runs/`. A Job's own files vanish with its pod.
+- **One run at a time.** The script refuses to start while another simulator Job is running.
+
+**Why.**
+
+- **Port-forwarding would measure the tunnel.** It squeezes every connection through one process on
+  the laptop. Inside the cluster, the chargers take the same path as any real client of the
+  Service.
+- **Three kinds of kill,** because they test different things. A crash is the honest test of
+  billing: nothing gets tidied up. A deleted pod is what a node failure or a chaos tool does. A
+  drain is what every deploy does, and it closes connections in the middle of sessions.
+- **The same seed as Milestone 3.** Seed 1 in kind produced exactly the Milestone 3 faults and
+  energy (15,954,825 Wh evidenced). That shows the scenario didn't change, only the infrastructure.
+
+**The storm check, made stricter.** The chargers expected to notice a kill are the ones in the
+killed pod's own list of its sockets, read just before. The registry is then checked against those
+lists separately. A charger that was already reconnecting when the kill came counts too, with its
+outage timed from when it began. Rebalancing moves (code 1013) are counted apart. Each rule came
+from a run the old check got wrong.
+
+**Known limits.**
+
+- One node: chargers, gateways and the database share one laptop's CPU.
+- After a crash, the pod keeps its address and stays in the Service for a second or two, so some
+  new connections reach the dead pod and are refused. The chargers back off and try again (D-028).
+- A run in a shared database can't keep its data for a post-mortem once the next run starts.

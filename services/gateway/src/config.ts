@@ -12,6 +12,13 @@ export interface GatewayConfig {
   redisPrefix: string;
   /** Postgres schema to use before `public`: tests give each run its own (D-014). */
   databaseSchema: string | undefined;
+  /** On SIGTERM, close the chargers' connections one by one over this many ms (D-037). */
+  shutdownDrainMs: number;
+  /** BootNotifications per second across all gateways, and how many at once (D-038). 0: no limit. */
+  bootRatePerSecond: number;
+  bootBurst: number;
+  /** How often to compare this gateway's share of the chargers with the others' (D-039). 0: never. */
+  rebalanceEveryMs: number;
 }
 
 /** Gateway settings from environment variables. DATABASE_URL is read by @voltline/db. */
@@ -29,6 +36,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): GatewayConfig 
     redisUrl: env['REDIS_URL'] ?? 'redis://localhost:6379',
     redisPrefix: env['REDIS_PREFIX'] ?? 'voltline:',
     databaseSchema: env['DATABASE_SCHEMA'] || undefined,
+    shutdownDrainMs: nonNegativeInteger('SHUTDOWN_DRAIN_MS', env['SHUTDOWN_DRAIN_MS'], 0),
+    bootRatePerSecond: nonNegativeInteger('BOOT_RATE_PER_S', env['BOOT_RATE_PER_S'], 0),
+    rebalanceEveryMs: nonNegativeInteger('REBALANCE_EVERY_MS', env['REBALANCE_EVERY_MS'], 0),
+    bootBurst: nonNegativeInteger(
+      'BOOT_BURST',
+      env['BOOT_BURST'],
+      nonNegativeInteger('BOOT_RATE_PER_S', env['BOOT_RATE_PER_S'], 0),
+    ),
   };
 }
 

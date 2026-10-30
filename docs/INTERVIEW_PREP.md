@@ -14,10 +14,11 @@ You don't need the same words. You need the same main idea and one concrete exam
 > WebSockets. The hard part is billing: chargers lose their connection, send messages twice, send
 > them late or in the wrong order, and sometimes their meters reset. I built the server and a
 > simulator of misbehaving chargers. With seeded fault injection, 5,000 sessions are billed
-> exactly to the watt-hour, even while gateway processes are being killed. I can also replay any
-> charger's recorded traffic to reproduce its bills. And it keeps every site under its power cap:
-> over 1,000 load changes, with chargers refusing limits and losing answers, the limits the
-> chargers really applied never went over the cap."
+> exactly to the watt-hour, even while Kubernetes gateway pods are being crashed, deleted and
+> drained. I can also replay any charger's recorded traffic to reproduce its bills. It keeps every
+> site under its power cap: over 1,000 load changes, with chargers refusing limits and losing
+> answers, the limits the chargers really applied never went over the cap. And when a gateway
+> restarts, the others hand its share of the chargers back to it, without a storm."
 
 ## The 2-minute walkthrough
 
@@ -38,6 +39,10 @@ You don't need the same words. You need the same main idea and one concrete exam
    lease, so a charger we lose contact with falls back to a safe default by itself. A command with
    no answer counts as "maybe applied" until its lease is over. The check uses what the chargers
    really applied, and two deliberately broken controllers prove that the check can fail.
+8. **Kubernetes.** One script brings everything up in kind. Gateways drain gradually when they
+   stop, share a budget for boot messages so a reconnect storm can't flood the database, and
+   rebalance their connections after a restart. The simulator and a chaos driver run inside the
+   cluster, and billing stays exact while pods are crashed, deleted and drained.
 
 ---
 
@@ -76,6 +81,22 @@ You don't need the same words. You need the same main idea and one concrete exam
 | 38,790 W vs 30,000 W     | What a restarted controller with no waiting period does, in a scripted test                    | `docs/results/m3-smart-charging-cap.md`         |
 | 75–82% → 83–86%          | Usefulness before and after relaxing the "no increase while a decrease is unconfirmed" rule    | `DECISIONS.md` D-033                            |
 | 504 / 496                | Five runs that ended the same way by chance; reruns gave 505/495 and 503/497                   | `docs/BUILD_JOURNAL.md`, Milestone 3 Part 4     |
+| 5,000 sessions × 6 runs  | Milestone 4: result 1 in Kubernetes, seeds 1, 2, 3, 1 again, 1 on a fresh cluster, and 2 again | `docs/results/m4-billing-with-pod-kills.md`     |
+| 8 to 13                  | Gateway pod kills per run, mixing crash, delete and drain                                      | same                                            |
+| 0 / 0 / 0 / 0            | Discrepancies, lost, invented and replay mismatches in every final Kubernetes run              | same                                            |
+| 15,954,825 Wh            | Seed 1's evidenced and billed energy: the same on processes (M3) and on pods (M4)              | same                                            |
+| 2 of 4                   | First official Kubernetes runs that failed: the simulator gave up on HTTP 503 (93 and 99)      | same                                            |
+| 7 / 4 / +5,375 Wh        | Corrections, sessions corrected and total when settling under pod kills: same as M3            | same                                            |
+| 1.4 s, 122 MiB           | Kind trial: 2,000 chargers into one pod, no boot budget yet; 0 dropped in 30 s                 | `docs/results/m4-kind-trial-and-rebalancing.md` |
+| 3.5–5.2 s                | Cold start of 2,000 chargers with the boot budget on (15 runs); 1,447–1,489 boots told Pending | `DECISIONS.md` D-038                            |
+| 500 a second             | The boot budget, shared by all gateways: a third of what one pod took in the trial             | `DECISIONS.md` D-038                            |
+| 0 → 637 in ~8 s          | A crashed gateway refilled by rebalancing, while the others came down from ~1,000 to ~680      | `docs/results/m4-kind-trial-and-rebalancing.md` |
+| 1.7 / 3.3 / 15.5 s       | Last charger back after one pod was crashed / deleted / drained (one run each)                 | same                                            |
+| 26 → 20                  | Chargers moved in the rebalancing test before and after counting chargers in transit           | `DECISIONS.md` D-039                            |
+| 40 → 0                   | Chargers that "never noticed" a crash, before and after the patience and check fixes           | `docs/results/m4-kind-trial-and-rebalancing.md` |
+| 238 MB                   | The one image every Voltline process runs                                                      | `DECISIONS.md` D-036                            |
+| 72 s                     | From no cluster at all to everything ready, with `pnpm kind:up`                                | `docs/results/m4-billing-with-pod-kills.md`     |
+| 99 + 73                  | Unit tests + integration tests at the end of Milestone 4                                       | `pnpm check`, `pnpm test:integration`           |
 
 ---
 
@@ -370,6 +391,122 @@ departures. I didn't report it until I understood it. The random generator passe
 gave 505/495 and 503/497. Offline spells last real milliseconds, so the exact split depends on
 timing: a seed fixes the decisions, not the timing. Five matching results were chance.
 
+### Kubernetes
+
+**Q: How does the system run in Kubernetes?**
+One script, `pnpm kind:up`, does everything on my laptop with kind, which runs a Kubernetes cluster
+inside Docker. Postgres and Redis run as StatefulSets with their own disks. The three gateways are
+a Deployment behind one Service, and chargers connect to the Service's address. The API is a
+Deployment, the charging controller is a Deployment of exactly one, and settlement is a CronJob that
+runs every minute. The migrations run as a Job before the services start.
+
+**Q: Why one image for every service?**
+Node runs our TypeScript directly, so the image is just the source code and its libraries, 238 MB.
+Every pod uses the same image and picks its program with its command. So the services always run
+the same version of the shared code, and there is only one thing to build.
+
+**Q: What is tini, and why do you need it?**
+A tiny program that runs as process 1 in each container. It passes the stop signal on to Node and
+cleans up finished child processes. I also needed it for my crash tests: inside a container, the
+kernel ignores SIGKILL sent to process 1 from inside the container. With tini as process 1, Node is
+an ordinary process, and my chaos driver can crash it.
+
+**Q: What do your readiness and liveness probes check?**
+Liveness asks "does the event loop still answer?". If not for 30 seconds, Kubernetes restarts the
+gateway. Readiness asks "are you listening, and not shutting down?". It deliberately does not
+check Postgres or Redis. If the database went down, every gateway would become unready at the same
+moment, the Service would have nowhere to send chargers, and we would turn a partial problem into a
+full outage.
+
+**Q: What happens when Kubernetes stops a gateway pod?**
+It removes the pod from the Service and starts stopping it at the same moment, so for a short time
+some nodes may still send it new chargers. So the gateway first waits 5 seconds (a preStop hook).
+Then, on SIGTERM, it says "not ready", answers new chargers with HTTP 503, and closes its own
+connections one by one over 10 seconds, so the chargers reconnect to the other gateways in a trickle
+instead of all at once. Then it flushes its frame log and exits.
+
+**Q: How do you kill pods in your tests, and why three different ways?**
+The chaos driver runs inside the cluster and kills a gateway every 0.5 to 1.5 seconds, in one of
+three ways picked by the seed. A crash sends SIGKILL to the gateway inside its container: nothing
+gets tidied up, which is the honest test for billing. A forced delete removes the pod at once and a
+new pod replaces it, like a node failure. A drain deletes it politely, like every deploy, and that
+closes connections in the middle of sessions. Each one tests something the others don't.
+
+**Q: How does the chaos driver get permission to kill pods?**
+With Kubernetes RBAC. The simulator Job runs as its own service account, and a Role lets it list,
+delete and exec into pods in our namespace, and read the gateway Deployment. Nothing else. It calls
+the Kubernetes API directly with the token Kubernetes gives every pod.
+
+**Q: Why not measure through `kubectl port-forward`?**
+Port-forward squeezes every connection through one program on my laptop. With 2,000 chargers I
+would be timing that tunnel, not the system. So the simulator runs as a Job inside the cluster and
+reaches the gateways through the Service, like any real client.
+
+**Q: Your charging controller must never run twice. How do you guarantee that in Kubernetes?**
+One replica with `strategy: Recreate`, so during a deploy the old pod stops before the new one
+starts. But if the pod is deleted, Kubernetes starts the replacement straight away, so for a moment
+two can run. That is still safe because a fresh controller sends nothing for one lease plus the
+clock allowance (D-032). By the time it sends anything, the old one is long gone.
+
+**Q: Why are migrations a Job and not run by every pod at start-up?**
+Our migrator takes a Postgres advisory lock, so running it in every pod would be safe. But it would
+add about half a second to every gateway start, and how fast a gateway comes back is exactly what
+the recovery result measures. So the script runs one migration Job before the services start.
+
+**Q: How do you protect the database from a boot storm?**
+Every reconnecting charger sends a BootNotification, and each one is a database write. The gateways
+share a budget of 500 boots a second in Redis. Over budget, the gateway answers "Pending" with an
+interval, which OCPP 1.6 says the charger must wait before booting again. The important detail: each
+charger gets its own appointment. If I told all of them "come back in 5 seconds", they would all
+come back together: the same storm, five seconds later.
+
+**Q: How does the budget work inside?**
+It is a token bucket stored as one number, the time at which the bucket would be full again (the
+GCRA algorithm). Each accepted boot moves that time forward by one interval. A charger turned away
+is booked at the next free moment, under its own key in Redis. When it comes back for its
+appointment, it is let in without paying again; if it comes back early, it keeps its place. All of
+it runs in one Lua script, on Redis's own clock, so the gateways never disagree.
+
+**Q: What if Redis is down?**
+Then the boot is accepted. The budget only protects the database; it is not worth turning chargers
+away for. Billing never depends on it.
+
+**Q: How do connections rebalance after a gateway restarts?**
+Every second, each gateway writes its number of chargers to Redis and reads the others'. One that
+has been clearly over its fair share for three seconds in a row closes up to 50 connections a
+second, and meanwhile turns new chargers away with 503. The chargers reconnect through the Service,
+and only the gateway with room accepts them. In kind, a crashed gateway went from 0 back to 637
+chargers in about 8 seconds, while the other two came down from about 1,000 to about 680.
+
+**Q: Why not just use least-connections load balancing?**
+That would need another proxy in front of the gateways, and OCPP has no way to redirect a charger.
+"Shed while over your share, and turn chargers away" builds least-connections into the gateways
+themselves.
+
+**Q: Why wait three seconds before rebalancing?**
+I found the problem in a test run. During a cold start, the counts are uneven for a few seconds just
+by chance, and rebalancing reacted to that: one charger was moved so often that it opened ten
+connections. Waiting for the imbalance to last is the same idea as the stabilization window in
+Kubernetes' own autoscaler.
+
+**Q: Tell me about a bug your Kubernetes tests found.**
+The first full fault runs in Kubernetes: two of four failed. The gateways were fine. Billing was
+exact for every session that finished. But nearly every simulated charger had given up. My simulator
+treated any HTTP refusal as permanent, because in earlier milestones it only meant "unknown
+charger". Now a draining or overloaded gateway answers 503, which means "try another gateway". Two
+runs passed only because no charger happened to hit a draining gateway. I fixed the simulator,
+added a test that fails without the fix, and ran all the seeds again.
+
+**Q: Tell me about a time your measurement was wrong.**
+My reconnect check compares two sources: the chargers that report a lost connection must be exactly
+the chargers that were on the killed pod. After crashes, about 40 never noticed. I suspected
+half-open TCP connections, and the node's connection table even seemed to support that. But when I
+counted both sides directly, they agreed, so that guess was wrong. Then I made the report write
+down each silent charger's history. In the next run two went silent, and both had been moved by
+rebalancing a second or two before the kill: they were still reconnecting. So the check needed to
+count them, and rebalancing needed to wait. After both fixes, no charger went silent again. The
+lesson: when a cross-check fails, find out exactly why before you change it.
+
 ### Design choices
 
 **Q: Why is billing inside the gateway and not a separate service?**
@@ -392,9 +529,11 @@ and our duplicate key already does.
 
 Saying these yourself makes you more convincing, not less.
 
-- The crashes so far are of processes on one machine, not pods in Kubernetes. That comes in
-  Milestone 4. Only gateways crash; Postgres and Redis stay up. There are no network partitions
-  yet: a gateway is either fully up or dead.
+- Kubernetes runs on one laptop, in one kind node: no node failures, and chargers, gateways and
+  the database share the CPU. Only gateways are killed; Postgres and Redis stay up (one replica
+  each). There are no network partitions: a gateway is either up or killed.
+- The kubectl on my laptop is three versions older than the cluster. Kubernetes only promises one;
+  everything worked, but I'd install a matching one for anything serious.
 - The faults come from my own model of an OCPP 1.6 charger. Real firmware varies. Testing with
   SAP's simulator comes later.
 - Simulated time is compressed. The run times show how long a test takes on my laptop. They are
@@ -408,42 +547,71 @@ Saying these yourself makes you more convincing, not less.
 - Corrections are recorded and checked, but nothing sends them anywhere: there is no invoicing. A
   session whose StopTransaction never arrives never settles.
 - The reconnect numbers are a lower bound: on one machine a killed process's sockets are reset at
-  once, and my backoff cap is 2 s. After a gateway restarts, connections don't rebalance.
+  once, and my backoff cap is 2 s.
+- The boot budget (500 a second) is a reasoned starting point, not a measured optimum. OCPP's
+  interval is in whole seconds, so appointments in the same second come back together.
+- Rebalancing evens the gateways only to within its slack (about ±10% at 2,000 chargers), and every
+  charger it moves costs a reconnect and a boot.
+- A pod deleted with no grace period gets only about 2 seconds, so most of its connections are cut,
+  not drained.
 
 ---
 
 ## Glossary
 
-| Term                   | Meaning                                                                                               |
-| ---------------------- | ----------------------------------------------------------------------------------------------------- |
-| CSMS                   | Charge Station Management System: the server that chargers talk to.                                   |
-| OCPP                   | Open Charge Point Protocol: the standard language between chargers and the CSMS.                      |
-| WebSocket              | A network connection that stays open, so both sides can send messages at any time.                    |
-| Session / transaction  | One charging session, from StartTransaction to StopTransaction.                                       |
-| idTag                  | The ID of the card or app that started the session.                                                   |
-| Wh, kWh                | Watt-hour and kilowatt-hour: units of energy. 1 kWh = 1,000 Wh.                                       |
-| Meter register         | The meter's running total of energy, like the odometer in a car.                                      |
-| Idempotent             | Safe to do twice: the second time changes nothing.                                                    |
-| At-least-once delivery | A message may arrive more than once, but it is never lost.                                            |
-| Duplicate key          | The values that identify "the same thing", so a copy can be recognised.                               |
-| Seed                   | The starting number for a random generator. The same seed gives the same choices.                     |
-| Property-based test    | A test that checks a rule against many generated inputs.                                              |
-| Replay                 | Feeding recorded messages into a fresh system to reproduce a past run.                                |
-| Row lock               | A database lock on one row, so two operations on it take turns.                                       |
-| Gateway                | The server process that holds the chargers' WebSocket connections.                                    |
-| SIGKILL                | A signal that stops a process immediately, with no chance to clean up: a realistic crash.             |
-| Backoff and jitter     | Waiting longer after each failed retry (backoff), by a random amount (jitter), so retries spread out. |
-| Group commit           | Many writers waiting for one shared database write, which makes the guarantee cheap.                  |
-| Pub/sub                | Publish/subscribe: a message sent on a named channel reaches whoever is listening on it right now.    |
-| Registry               | Here, the Redis record of which gateway holds each charger's connection.                              |
-| Epoch                  | A counter that grows with each new connection of a charger, so newer can be told from older.          |
-| Cap                    | The most power a site may draw at once.                                                               |
-| Settled bill           | A session's bill once its evidence has gone quiet: it is never changed after that.                    |
-| Jitter                 | Waiting a random part of a backoff, so clients that failed together don't all retry together.         |
-| p50 / p95 / p99        | The value that 50% / 95% / 99% of the measurements are at or below.                                   |
-| Correction             | A dated record of a change to a settled bill: old amount, new amount, difference.                     |
-| Default limit          | What a charger may draw with no instructions from us (its TxDefaultProfile).                          |
-| Lease (`validTo`)      | The time a limit stops applying unless it is renewed; then the charger falls back to its default.     |
-| Worst case             | The most a connector might be drawing, given changes we sent but haven't heard back about.            |
-| Usefulness             | The share of the spare power the chargers were really allowed to use, over time.                      |
-| Negative control       | A deliberately broken version that the test must catch, to prove the test can fail.                   |
+| Term                   | Meaning                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------ |
+| CSMS                   | Charge Station Management System: the server that chargers talk to.                                    |
+| OCPP                   | Open Charge Point Protocol: the standard language between chargers and the CSMS.                       |
+| WebSocket              | A network connection that stays open, so both sides can send messages at any time.                     |
+| Session / transaction  | One charging session, from StartTransaction to StopTransaction.                                        |
+| idTag                  | The ID of the card or app that started the session.                                                    |
+| Wh, kWh                | Watt-hour and kilowatt-hour: units of energy. 1 kWh = 1,000 Wh.                                        |
+| Meter register         | The meter's running total of energy, like the odometer in a car.                                       |
+| Idempotent             | Safe to do twice: the second time changes nothing.                                                     |
+| At-least-once delivery | A message may arrive more than once, but it is never lost.                                             |
+| Duplicate key          | The values that identify "the same thing", so a copy can be recognised.                                |
+| Seed                   | The starting number for a random generator. The same seed gives the same choices.                      |
+| Property-based test    | A test that checks a rule against many generated inputs.                                               |
+| Replay                 | Feeding recorded messages into a fresh system to reproduce a past run.                                 |
+| Row lock               | A database lock on one row, so two operations on it take turns.                                        |
+| Gateway                | The server process that holds the chargers' WebSocket connections.                                     |
+| SIGKILL                | A signal that stops a process immediately, with no chance to clean up: a realistic crash.              |
+| Backoff and jitter     | Waiting longer after each failed retry (backoff), by a random amount (jitter), so retries spread out.  |
+| Group commit           | Many writers waiting for one shared database write, which makes the guarantee cheap.                   |
+| Pub/sub                | Publish/subscribe: a message sent on a named channel reaches whoever is listening on it right now.     |
+| Registry               | Here, the Redis record of which gateway holds each charger's connection.                               |
+| Epoch                  | A counter that grows with each new connection of a charger, so newer can be told from older.           |
+| Cap                    | The most power a site may draw at once.                                                                |
+| Settled bill           | A session's bill once its evidence has gone quiet: it is never changed after that.                     |
+| Jitter                 | Waiting a random part of a backoff, so clients that failed together don't all retry together.          |
+| p50 / p95 / p99        | The value that 50% / 95% / 99% of the measurements are at or below.                                    |
+| Correction             | A dated record of a change to a settled bill: old amount, new amount, difference.                      |
+| Default limit          | What a charger may draw with no instructions from us (its TxDefaultProfile).                           |
+| Lease (`validTo`)      | The time a limit stops applying unless it is renewed; then the charger falls back to its default.      |
+| Worst case             | The most a connector might be drawing, given changes we sent but haven't heard back about.             |
+| Usefulness             | The share of the spare power the chargers were really allowed to use, over time.                       |
+| Negative control       | A deliberately broken version that the test must catch, to prove the test can fail.                    |
+| Pod                    | One running copy of a program in Kubernetes, with its own IP address.                                  |
+| Deployment             | Keeps a number of identical pods running, and replaces any that die.                                   |
+| Service                | One stable address in front of a group of pods; it picks a ready pod for each new connection.          |
+| StatefulSet            | Like a Deployment, but each pod keeps its name and its own disk: for databases.                        |
+| Job / CronJob          | A program Kubernetes runs once to the end / on a schedule.                                             |
+| Readiness probe        | "Can you take traffic?" If not, the Service stops sending you any.                                     |
+| Liveness probe         | "Are you still working?" If not, Kubernetes restarts the container.                                    |
+| preStop hook           | Something Kubernetes runs just before it sends SIGTERM; ours is a 5-second pause.                      |
+| Grace period           | How long Kubernetes waits after SIGTERM before it sends SIGKILL (30 s for our gateways).               |
+| Drain                  | Closing a server's connections gradually before it stops, so clients move in a trickle.                |
+| CrashLoopBackOff       | Kubernetes waiting longer and longer before restarting a container that keeps crashing.                |
+| kind                   | Kubernetes in Docker: a whole cluster in one container on a laptop.                                    |
+| tini / process 1       | A tiny first process in a container that passes signals on and can't be skipped by the kernel rules.   |
+| RBAC, Role             | Kubernetes permissions: a Role lists exactly what an identity (a service account) may do.              |
+| port-forward           | A kubectl tunnel from the laptop into the cluster; fine for poking around, wrong for measuring.        |
+| Token bucket           | A rate limit: tokens refill at a steady rate, each request takes one, and a full bucket allows bursts. |
+| GCRA                   | A way to keep a token bucket as one number: the time at which it would be full again.                  |
+| Appointment            | Here: the moment a turned-away charger is booked to boot again, so retries come back spread out.       |
+| Rebalancing            | Moving connections from busy gateways to quiet ones, here by closing a few and refusing new ones.      |
+| Fair share / slack     | Chargers per gateway if spread evenly / how far over it a gateway may be before it sheds.              |
+| Stabilization window   | Waiting for a change to last before reacting to it ("patience"), so noise doesn't cause churn.         |
+| Half-open connection   | One side thinks a TCP connection is open, but the other side is gone.                                  |
+| conntrack              | The Linux kernel's table of connections, which Kubernetes' Service routing relies on.                  |

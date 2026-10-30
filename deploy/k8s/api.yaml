@@ -1,0 +1,108 @@
+# The REST API. It keeps no state of its own (D-030), so any number of copies could run.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: voltline
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: api
+        app.kubernetes.io/part-of: voltline
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: voltline:dev
+          imagePullPolicy: Never
+          args: ['node', 'services/api/src/main.ts']
+          env:
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: LOG_LEVEL
+              value: info
+          ports:
+            - name: http
+              containerPort: 9230
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 384Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: voltline
+spec:
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 9230
+      targetPort: http
+---
+# The API from the laptop, at http://localhost:19230 (see deploy/kind/cluster.yaml).
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-nodeport
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: api
+    app.kubernetes.io/part-of: voltline
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: api
+  ports:
+    - name: http
+      port: 9230
+      targetPort: http
+      nodePort: 30230

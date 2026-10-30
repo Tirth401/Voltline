@@ -10,6 +10,7 @@ import { settleDueSessions } from '@voltline/billing';
 import type { Pool, Queryable } from '@voltline/db';
 import { createTestDatabase, type TestDatabase } from '@voltline/db/testing';
 import {
+  BootBudget,
   createGateway,
   loadRecordedCalls,
   PostgresFrameLog,
@@ -37,7 +38,12 @@ export interface Stack {
 }
 
 export async function startStack(
-  options: { pingIntervalMs?: number; logLevel?: string } = {},
+  options: {
+    pingIntervalMs?: number;
+    logLevel?: string;
+    /** A BootNotification budget for this gateway (D-038). */
+    bootBudget?: { ratePerSecond: number; burst: number };
+  } = {},
 ): Promise<Stack> {
   const db = await createTestDatabase();
   const redis = createTestRedis();
@@ -53,6 +59,9 @@ export async function startStack(
     frameLog,
     validateResponses: true,
     ...(options.pingIntervalMs !== undefined && { pingIntervalMs: options.pingIntervalMs }),
+    ...(options.bootBudget && {
+      bootBudget: new BootBudget(redis, { ...options.bootBudget, keyPrefix: redisPrefix }),
+    }),
   });
   const { port } = await gateway.listen(0, '127.0.0.1');
   return {
@@ -99,6 +108,30 @@ export async function registerChargers(
   ]);
 }
 
+/**
+ * Deletes everything these chargers ever did, and the chargers themselves. A run in a shared
+ * database (the one inside the kind cluster) starts from this clean slate, so a seed always means
+ * the same chargers doing the same things, and nothing an earlier run left behind is counted.
+ */
+export async function forgetChargers(
+  db: Queryable,
+  chargers: readonly ChargerIdentity[],
+): Promise<void> {
+  const ids = chargers.map((charger) => charger.chargePointId);
+  await db.query(
+    `DELETE FROM bill_corrections
+      WHERE transaction_id IN (SELECT transaction_id FROM transactions WHERE charge_point_id = ANY($1))`,
+    [ids],
+  );
+  for (const table of ['meter_readings', 'ocpp_frames', 'transactions']) {
+    await db.query(`DELETE FROM ${table} WHERE charge_point_id = ANY($1)`, [ids]);
+  }
+  await db.query('DELETE FROM charge_points WHERE id = ANY($1)', [ids]);
+  await db.query('DELETE FROM id_tags WHERE id_tag = ANY($1)', [
+    chargers.map((charger) => charger.idTag),
+  ]);
+}
+
 export interface SessionProblem {
   chargePointId: string;
   index: number;
@@ -130,6 +163,8 @@ export interface BillingReport {
   };
   /** Times a charger's connection broke under it (a gateway crashed) and it reconnected. */
   reconnects: number;
+  /** BootNotifications the gateways answered Pending: over the boot budget (D-038). */
+  pendingBoots: number;
   /** The faults that actually happened: a run that injected none would prove nothing. */
   faults: {
     offlineSpells: number;
@@ -205,6 +240,7 @@ export async function checkBilling(
     problems: [],
     energy: { physicalWh: 0, evidencedWh: 0, billedWh: 0 },
     reconnects: 0,
+    pendingBoots: 0,
     faults: {
       offlineSpells: 0,
       lateStarts: 0,
@@ -294,6 +330,7 @@ export async function checkBilling(
     faults.lostResponses += truth.faults.lostResponses;
     faults.droppedAfterSend += truth.faults.droppedAfterSend;
     report.reconnects += truth.faults.reconnects;
+    report.pendingBoots += truth.faults.pendingBoots;
   }
   report.invented = rows.filter((row) => !matched.has(row.transaction_id)).length;
   return report;
@@ -359,11 +396,15 @@ export async function replayAndCompare(
       });
     }
 
+    // Only these chargers: the source may be a shared database holding other chargers too.
+    const ids = chargers.map((charger) => charger.chargePointId);
     const bills = async (db: Queryable): Promise<Map<string, number | null>> => {
       const { rows } = await db.query<{ key: string; energy_wh: number | null }>(
         `SELECT charge_point_id || '|' || connector_id || '|' || started_at || '|' || meter_start_wh
                   AS key, energy_wh
-           FROM transactions`,
+           FROM transactions
+          WHERE charge_point_id = ANY($1)`,
+        [ids],
       );
       return new Map(rows.map((row) => [row.key, row.energy_wh]));
     };

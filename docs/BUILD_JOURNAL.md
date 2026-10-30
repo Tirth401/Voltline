@@ -518,6 +518,232 @@ The numbers are in [results/m3-reconnect-storm.md](results/m3-reconnect-storm.md
 
 ---
 
+## Milestone 4: Kubernetes
+
+**Goal:** run the whole system in Kubernetes on one laptop, with one command, and show that billing
+stays exact when real Kubernetes pods are killed.
+
+### Part 1: a short guide to the Kubernetes words
+
+Kubernetes runs programs in containers and keeps them running. The words we need:
+
+- A **pod** is one running copy of a program (one container, for us). It has its own IP address.
+- A **Deployment** keeps a number of identical pods running. If a pod dies, it starts a new one.
+  Our gateways are a Deployment of three.
+- A **Service** is one stable address in front of a group of pods. Chargers connect to
+  `ws://gateway:9220/ocpp`, and for each new connection the Service picks one ready pod at random.
+- A **StatefulSet** is like a Deployment, but each pod keeps its name and its own disk. Postgres
+  and Redis are StatefulSets.
+- A **Job** runs a program to the end once. A **CronJob** starts a Job on a schedule. The
+  migrations are a Job; settlement is a CronJob that runs every minute.
+- **Probes** are questions Kubernetes keeps asking each pod. "Are you ready?" decides whether the
+  Service sends it traffic. "Are you alive?" decides whether to restart it.
+- **kind** ("Kubernetes in Docker") runs a whole Kubernetes cluster inside one Docker container on
+  the laptop.
+
+### Part 2: one script brings everything up
+
+`pnpm kind:up` does it all: it creates the cluster, builds our image, loads the images into the
+cluster, starts Postgres and Redis, runs the migrations, starts the gateways, the API, the charging
+controller and the settlement CronJob, and waits until all of them are ready. From nothing at all
+to everything ready takes 72 seconds on my laptop. Run it again and it only changes what changed
+(D-036).
+
+**One image for everything.** Node runs our TypeScript directly (D-003), so the image is just the
+source code plus the libraries: 238 MB. Each pod picks its program by its command:
+`node services/gateway/src/main.ts`, `node services/api/src/main.ts`, and so on.
+
+**A small program called tini runs first in every container.** It passes the stop signal on to
+Node. It also solves a problem we only hit later: inside a container, the kernel protects process
+number 1 from SIGKILL. If Node were process 1, our chaos driver could not crash it. With tini as
+process 1, Node is an ordinary process and can be killed.
+
+**Problems on the way:**
+
+- **Loading the database image failed** with "content digest not found". Docker Desktop lists every
+  platform of an image (Intel and ARM) but only stores the one this laptop uses, and kind tried to
+  copy all of them. The fix: save only this machine's platform to a file and load that.
+- **The kubectl on this laptop is three versions older than the cluster** (it comes with Docker
+  Desktop). Kubernetes only promises one version of difference. Everything worked, so the script
+  just prints a warning and lets you choose another kubectl.
+- **The API client for the chaos driver broke after its first pod delete:** the next request got a
+  bare "400 Bad Request". The DELETE request had a body but no length, and reusing that connection
+  confused the API server. Each request now uses a fresh connection and states its length.
+
+### Part 3: the kind trial, finally
+
+Back in Milestone 1 we planned a trial: 2,000 chargers connecting to one gateway pod, from a Job
+inside the cluster. We had skipped it. Now it was the first step.
+
+All 2,000 chargers were accepted within 1.4 seconds. The single pod held them with 122 MiB of
+memory, and in 30 seconds of watching, not one connection dropped. So one pod has plenty of room,
+and the whole measuring setup works inside the cluster
+([results](results/m4-kind-trial-and-rebalancing.md)).
+
+### Part 4: shutting down gently
+
+When Kubernetes stops a pod (for a deploy, say), it removes the pod from the Service **and** starts
+stopping it **at the same moment**. For a short while, some nodes may still send it new chargers.
+So the gateway now stops in four steps (D-037):
+
+1. **Pause for 5 seconds** (the "preStop hook"), so every node has stopped sending it chargers.
+2. **Say "not ready"** and answer any new charger with HTTP 503: "go somewhere else".
+3. **Close its connections one by one over 10 seconds.** A gateway with 700 chargers that closed
+   them all at once would send 700 reconnects at the other gateways in the same instant. Spread
+   over 10 seconds, it is 70 a second.
+4. **Flush the frame log and exit.**
+
+**A mistake the test caught:** my first version stopped listening the moment it was told to stop.
+Then a late charger got "connection refused" instead of a clear 503, and the readiness check could
+not even answer "draining". Now the gateway stops listening last.
+
+### Part 5: a budget for boots
+
+When thousands of chargers reconnect after an outage, each one sends a BootNotification, and each
+boot is a database write. OCPP 1.6 lets the server say **"Pending"** with an **interval**: "come
+back in N seconds". So the gateways now share a budget of 500 boots a second, kept in Redis (D-038).
+
+**The trap I wanted to avoid.** If every charger that is turned away hears "come back in 5
+seconds", they all come back together 5 seconds later: the same storm, just postponed. So each
+charger gets its **own appointment**. An example with a budget of 10 a second: 30 chargers boot at
+the same moment. The first 10 are accepted. Charger 11 hears "come back in 0.1 s", charger 12
+"0.2 s", and so on. When a charger comes back for its appointment, it is let in without using the
+budget again. If it comes back early, it keeps its place in the queue.
+
+The tests use a fake clock. A **property test** throws random arrivals at random budgets and checks
+three rules: every charger gets in eventually, a charger that comes back when told is never turned
+away twice, and the number accepted never runs ahead of "burst + rate × time".
+
+One more test protects the seeds: the same seed, run with and without a tight budget, must give
+exactly the same faults and the same energy. Waiting for an appointment uses no random numbers, so a
+seed still means the same scenario.
+
+### Part 6: rebalancing after a restart
+
+In Milestone 3 we saw that after a gateway restarts, it stays almost empty: one ended with 3
+chargers while the others had about 1,000 each. The Service picks a random pod for each **new**
+connection, and chargers that are already connected have no reason to move.
+
+**The idea** (D-039): every second, each gateway writes its number of chargers to Redis and reads
+everyone else's. A gateway that holds clearly more than its fair share closes a few connections
+each second, and while it does, it answers new chargers with 503. Those chargers reconnect through
+the Service, get turned away by the busy gateways, and end up on the one with room.
+
+**Three things went wrong first, and each one taught me something:**
+
+1. **It moved too many.** In the test, 40 chargers should end 20 and 20, with 20 moved. It moved 26.
+   I traced it round by round: chargers that are in the middle of moving are in **nobody's** count
+   for a moment, so the total looked smaller and the "fair share" too low. Now a gateway that is
+   shedding never lets its estimate of the total go down. Exactly 20 moved.
+2. **It moved chargers during a cold start.** When 2,000 chargers start at once, the counts are
+   uneven for a few seconds just by chance, and rebalancing reacted to that. One charger was moved
+   so often that it opened 10 connections. Now the imbalance must last **three seconds in a row**
+   before anyone is moved. Kubernetes' own autoscaler uses the same trick, called a stabilization
+   window.
+3. **My first test expected an exact result.** Each gateway sees the others' counts up to a second
+   late, so "exactly 20 and 20" was too strict for the real system. The test now checks what
+   matters: within the slack, and then nobody moves again.
+
+In the cluster, after one gateway pod was crashed, the restarted pod filled up again in about 8
+seconds: from 0 to 637 chargers, while the other two came down from about 1,000 to about 680.
+
+### Part 7: measuring inside the cluster
+
+The simulator now runs as a Kubernetes **Job inside the cluster** (D-040). The chargers reach the
+gateways through the Service, exactly like real clients would. We never measure through
+`kubectl port-forward`: that squeezes every connection through one program on the laptop, so we
+would be timing the tunnel, not the system.
+
+The **chaos driver** runs in the same Job. It has a narrow permission (a Kubernetes "Role"): it may
+list, delete and exec into pods in our namespace, and nothing else. It kills a gateway every 0.5 to
+1.5 seconds, in one of three ways, picked by the seed:
+
+| Kind of kill | What happens                                                                 | Like in real life                 |
+| ------------ | ---------------------------------------------------------------------------- | --------------------------------- |
+| crash        | SIGKILL to the gateway inside its container; Kubernetes restarts it in place | a crash, or running out of memory |
+| delete       | the pod is deleted at once; a new pod with a new address replaces it         | a node failure, or a chaos tool   |
+| drain        | the pod is deleted politely: pause, stop signal, 10 seconds of draining      | every deploy                      |
+
+As in Milestone 3, it never kills a gateway unless at least two are ready.
+
+**The investigation that taught me the most.** The storm check (D-035) compares two sources: the
+chargers that say "I lost my connection" must be exactly the chargers that were on the killed
+pod. In the first crash runs, it failed: about 40 chargers on the killed pod never noticed.
+
+My first guess was "half-open" connections: the server dies, but the network never tells the
+client, so the client thinks it is still connected. I checked the network's connection table
+(conntrack) on the node, and it did show some entries disappearing during the crash. But then I
+counted both sides directly: the chargers' open sockets and the gateways' own counts. **They
+agreed.** No charger was stuck on a dead connection. So the guess was wrong.
+
+The real answer came from making the report write down each silent charger's history. In the
+next crash run, two chargers went silent, and both had been **moved by rebalancing a second or two
+before the kill**. They were still reconnecting (waiting for their boot appointment) when the kill
+came, so they never had a "new" loss to report. That gave two fixes: the check now counts a charger
+that was already reconnecting, with its outage timed from when it really began; and rebalancing got
+its three-second patience (Part 6). I never traced the earlier 40 one by one, but after the two
+fixes no charger went silent again, in any run.
+
+The lesson: **when a cross-check fails, it is usually right.** Don't change the check until you
+know exactly why it failed. Here, it found one measurement mistake and one real design problem.
+
+### Part 8: result 1 in Kubernetes
+
+The exit check of this milestone: the 5,000-session fault run, now inside Kubernetes, with real
+gateway pods killed.
+
+**The first official batch failed twice.** Of four runs, two passed, and in the other two almost
+every simulated charger gave up with "HTTP 503". Billing was not the problem: every session that
+finished was billed exactly. The problem was in my simulator. It treated any refused connection as
+permanent, because until now a refusal only ever meant "unknown charger". But this milestone gave
+503 a new meaning: a gateway that is draining, or holds more than its share, says "503, try another
+gateway". Two runs passed only by luck: no charger happened to reach a draining gateway. I fixed
+the simulator, wrote a test with a fake gateway that always answers 503 (it fails without the fix),
+and ran all four again.
+
+**The final runs** ([results](results/m4-billing-with-pod-kills.md)). For the fifth, I deleted the
+cluster and brought it up again from nothing, to check the whole exit check in one go. The sixth
+ran after one last small change (a gateway shutting down now waits at most a second for Redis):
+
+| Seed                  | Pod kills (crash / delete / drain) | Reconnects | Discrepancies | Lost or invented | Replay mismatches |
+| --------------------- | ---------------------------------- | ---------- | ------------- | ---------------- | ----------------- |
+| 1                     | 11 (5 / 3 / 3)                     | 191        | 0             | 0                | 0                 |
+| 2                     | 11 (4 / 2 / 5)                     | 197        | 0             | 0                | 0                 |
+| 3                     | 13 (4 / 5 / 4)                     | 191        | 0             | 0                | 0                 |
+| 1, once more          | 9 (4 / 4 / 1)                      | 128        | 0             | 0                | 0                 |
+| 1, on a fresh cluster | 8 (4 / 3 / 1)                      | 125        | 0             | 0                | 0                 |
+| 2, on the final code  | 13 (6 / 3 / 4)                     | 178        | 0             | 0                | 0                 |
+
+The best detail: **every fault count and every energy total is exactly the same as in Milestone 3.**
+Seed 1 had 1,477 offline spells and 6,433 lost answers, and 15,954,825 Wh were evidenced and billed,
+both on processes on my laptop and on pods in Kubernetes. The seed fixes what the chargers do;
+only the infrastructure changed. So the same 5,000 sessions were billed to the same watt-hour by
+two different setups.
+
+One more run settled every bill the moment it stopped, while pods were being killed (as in Milestone
+3, Part 5). All 5,000 sessions settled while the chargers ran, with 7 corrections on 4 sessions,
++5,375 Wh: again exactly the Milestone 3 numbers for seed 1.
+
+### What I learned
+
+- **A new meaning for an old signal breaks old assumptions.** "503" was harmless until the gateways
+  started using it to mean "try elsewhere". The simulator had a rule that was true when I wrote it.
+  Full-size runs with every kind of kill found it; the small tests didn't.
+- **Kubernetes stops a pod in two places at once.** It removes the pod from the Service and stops
+  the program at the same moment. A short pause (preStop) is what makes a clean shutdown possible.
+- **Never retry everyone after the same delay.** A rate limit that says "come back in 5 seconds" to
+  everyone just moves the storm. Give each client its own time.
+- **Random load balancing never moves anyone back.** After a restart, someone has to move
+  connections on purpose, slowly, and only when the imbalance is real and lasts.
+- **When a cross-check fails, believe it until you can explain it.** My storm check failed four
+  times. Twice the check had a gap (rebalancing moves, chargers caught mid-reconnect), and twice the
+  system had a real problem (a simulator bug, rebalancing during a cold start). My first theory,
+  half-open connections, was wrong, and I only knew because I counted both sides.
+- **Report every run.** The failed runs taught me more than the passing ones, so the results files
+  list all of them.
+
+---
+
 ## Lessons that apply to any backend
 
 1. **Save before you answer**, and make every write safe to repeat.
@@ -527,3 +753,7 @@ The numbers are in [results/m3-reconnect-storm.md](results/m3-reconnect-storm.md
 5. **Prove your faults happened.** A chaos test that injects nothing proves nothing.
 6. **Write down decisions and corrections.** Being honest about a wrong turn is more convincing
    than pretending there were none.
+7. **Measure where the client is.** Inside the cluster, through the same Service a real client uses,
+   never through a debugging tunnel.
+8. **Spread out every retry.** Backoff with jitter for reconnects, appointments for rate limits, and
+   a gradual drain at shutdown: a crowd that acts in step is a storm.

@@ -1,0 +1,117 @@
+# Postgres with TimescaleDB: one replica with its own disk (a StatefulSet). The same pinned image as
+# docker-compose.yml (D-015). High availability for the database is out of scope.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres
+  namespace: voltline
+  labels:
+    app.kubernetes.io/part-of: voltline
+type: Opaque
+# A local test cluster: the same throwaway password as docker-compose.yml. A real deployment would
+# take these from a secret manager.
+stringData:
+  POSTGRES_USER: voltline
+  POSTGRES_PASSWORD: voltline
+  POSTGRES_DB: voltline
+  DATABASE_URL: postgres://voltline:voltline@postgres:5432/voltline
+---
+# What the services connect to: a stable virtual IP, even when the pod behind it is replaced.
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: voltline
+spec:
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# The StatefulSet's own headless Service, which gives its pod a stable DNS name (postgres-0).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-headless
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: voltline
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: voltline
+spec:
+  serviceName: postgres-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: voltline
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: postgres
+          image: timescale/timescaledb:2.31.0-pg17
+          imagePullPolicy: IfNotPresent
+          args: ['postgres', '-c', 'timescaledb.telemetry_level=off', '-c', 'max_connections=200']
+          envFrom:
+            - secretRef:
+                name: postgres
+          env:
+            # A subfolder, so the volume's own top-level files never confuse initdb.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'voltline', '-d', 'voltline']
+            periodSeconds: 2
+            timeoutSeconds: 2
+          livenessProbe:
+            exec:
+              command: ['pg_isready', '-U', 'voltline', '-d', 'voltline']
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1536Mi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ['ReadWriteOnce']
+        resources:
+          requests:
+            storage: 10Gi

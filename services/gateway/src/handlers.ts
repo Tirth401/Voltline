@@ -20,6 +20,7 @@ import {
   type V16Validator,
 } from '@voltline/ocpp';
 import type { Logger } from 'pino';
+import { retryIntervalSeconds, type BootBudget } from './boot-budget.ts';
 import type { CallOutcome } from './connection.ts';
 
 export interface HandlerDeps {
@@ -28,6 +29,10 @@ export interface HandlerDeps {
   clock: Clock;
   /** Told to chargers in BootNotification.conf: how often to send a Heartbeat. */
   heartbeatIntervalSec: number;
+  /** Over this budget, a BootNotification is answered Pending (D-038). None: every boot is accepted. */
+  bootBudget?: BootBudget;
+  /** Told about each BootNotification answered Pending. */
+  onPendingBoot?: () => void;
 }
 
 interface HandlerContext extends HandlerDeps {
@@ -48,6 +53,21 @@ type Handler<A extends V16ChargerAction> = (
  */
 const handlers: { [A in V16ChargerAction]: Handler<A> } = {
   BootNotification: async (ctx, request) => {
+    // Over the cluster's budget, the charger must come back after its interval, and nothing is
+    // written. If Redis can't answer, let the boot in: the budget protects the database, it isn't
+    // worth turning chargers away for.
+    const admission = await ctx.bootBudget?.admit(ctx.chargePointId).catch((error: unknown) => {
+      ctx.log.warn({ err: error }, 'boot budget unavailable: accepting the boot');
+      return undefined;
+    });
+    if (admission?.accepted === false) {
+      ctx.onPendingBoot?.();
+      return {
+        status: 'Pending',
+        currentTime: ctx.now.toISOString(),
+        interval: retryIntervalSeconds(admission.waitMs),
+      };
+    }
     // Updates details only: the gateway refused the socket if the charger wasn't registered (D-017).
     await ctx.db.query(
       `UPDATE charge_points

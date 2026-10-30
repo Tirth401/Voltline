@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { Duplex } from 'node:stream';
+import { setTimeout as sleep } from 'node:timers/promises';
 import type { AvailabilityStore } from '@voltline/availability';
 import { systemClock, type Clock } from '@voltline/common';
 import type { Pool } from '@voltline/db';
@@ -9,10 +10,17 @@ import type { V16Validator } from '@voltline/ocpp';
 import type { CommandBus, ConnectionRegistry, SupersededNotice } from '@voltline/routing';
 import type { Logger } from 'pino';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
+import type { BootBudget } from './boot-budget.ts';
 import { runCommand } from './commands.ts';
 import { ChargerConnection } from './connection.ts';
 import type { FrameLog } from './frame-log.ts';
 import { createDispatcher } from './handlers.ts';
+import {
+  planRebalance,
+  type LoadBoard,
+  type RebalanceSettings,
+  type RebalanceState,
+} from './rebalance.ts';
 
 export interface GatewayOptions {
   db: Pool;
@@ -30,6 +38,8 @@ export interface GatewayOptions {
   pingIntervalMs?: number;
   /** Also check our own responses against the schemas. On in tests; costs a little CPU. */
   validateResponses?: boolean;
+  /** Over this budget, shared by every gateway, BootNotifications are answered Pending (D-038). */
+  bootBudget?: BootBudget;
   /** Names this gateway among several. Default: a random id. */
   gatewayId?: string;
   /**
@@ -37,12 +47,22 @@ export interface GatewayOptions {
    * and close sockets that a charger has replaced on another gateway (D-030).
    */
   routing?: { registry: ConnectionRegistry; bus: CommandBus };
+  /**
+   * Every `everyMs`, report how many chargers this gateway holds, and shed connections while it
+   * holds clearly more than its fair share (D-039).
+   */
+  rebalance?: { board: LoadBoard; everyMs: number; settings: RebalanceSettings };
 }
 
 export interface Gateway {
   readonly gatewayId: string;
   listen(port: number, host?: string): Promise<AddressInfo>;
-  close(): Promise<void>;
+  /**
+   * Stops taking new chargers, closes every connection, and resolves once they are all closed.
+   * With `drainMs`, the connections are closed one by one, evenly spread over that many ms, so
+   * their chargers reconnect to the other gateways in a trickle rather than all at once (D-037).
+   */
+  close(options?: { drainMs?: number }): Promise<void>;
   /** Live connections, by charger identity. */
   readonly connections: ReadonlyMap<string, ChargerConnection>;
 }
@@ -78,6 +98,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       .finally(() => routingWrites.delete(tracked));
     routingWrites.add(tracked);
   };
+  let pendingBoots = 0;
   const dispatch = createDispatcher({
     db: options.db,
     availability: options.availability,
@@ -85,6 +106,12 @@ export function createGateway(options: GatewayOptions): Gateway {
     heartbeatIntervalSec: options.heartbeatIntervalSec ?? 300,
     validator: options.validator,
     validateResponses: options.validateResponses ?? false,
+    ...(options.bootBudget && {
+      bootBudget: options.bootBudget,
+      onPendingBoot: () => {
+        pendingBoots += 1;
+      },
+    }),
   });
 
   const wss = new WebSocketServer({
@@ -93,9 +120,40 @@ export function createGateway(options: GatewayOptions): Gateway {
     handleProtocols: (protocols) => (protocols.has(SUBPROTOCOL) ? SUBPROTOCOL : false),
   });
 
+  // Set once shutdown begins: from then on the gateway is "not ready" and turns new chargers away.
+  let draining = false;
+  // Set while this gateway holds clearly more than its share: it turns new chargers away (D-039).
+  let shedding = false;
+  let shedConnections = 0;
+
   const server = createServer((request, response) => {
+    // Alive: the event loop answers. Kubernetes restarts a gateway that stops answering this.
     if (request.url === '/healthz') {
       response.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok\n');
+      return;
+    }
+    // Ready: willing to take new chargers. False while draining, so the Service stops sending any.
+    if (request.url === '/readyz') {
+      response
+        .writeHead(draining ? 503 : 200, { 'Content-Type': 'text/plain' })
+        .end(draining ? 'draining\n' : 'ready\n');
+      return;
+    }
+    // For the measurement runs: how many chargers this gateway holds, read from inside the cluster.
+    // /status/chargers also lists them, to check the registry against the truth.
+    if (request.url === '/status' || request.url === '/status/chargers') {
+      response.writeHead(200, { 'Content-Type': 'application/json' }).end(
+        JSON.stringify({
+          gatewayId,
+          connections: connections.size,
+          pendingBoots,
+          shedConnections,
+          shedding,
+          draining,
+          rssBytes: process.memoryUsage.rss(),
+          ...(request.url === '/status/chargers' && { chargers: [...connections.keys()] }),
+        }),
+      );
       return;
     }
     response
@@ -111,6 +169,12 @@ export function createGateway(options: GatewayOptions): Gateway {
   });
 
   async function acceptCharger(request: IncomingMessage, socket: Duplex, head: Buffer) {
+    // Shutting down, or holding more than our share: the charger should go to another gateway.
+    // It retries with backoff (D-028), and the Service picks a pod at random again.
+    if (draining || shedding) {
+      refuse(socket, 503, 'Service Unavailable');
+      return;
+    }
     const match = OCPP_PATH.exec(new URL(request.url ?? '/', 'http://gateway').pathname);
     const chargePointId = match?.[1] === undefined ? undefined : decodePathSegment(match[1]);
     if (chargePointId === undefined || !CHARGE_POINT_ID.test(chargePointId)) {
@@ -129,6 +193,11 @@ export function createGateway(options: GatewayOptions): Gateway {
     if (known.rowCount === 0) {
       log.warn({ chargePointId }, 'refused an unregistered charger');
       refuse(socket, 404, 'Not Found');
+      return;
+    }
+    // Shutdown may have begun while the lookup ran.
+    if (draining) {
+      refuse(socket, 503, 'Service Unavailable');
       return;
     }
     wss.handleUpgrade(request, socket, head, (ws) => {
@@ -222,6 +291,51 @@ export function createGateway(options: GatewayOptions): Gateway {
     connectionLog.info('connected');
   }
 
+  // Rebalancing: one round every `everyMs`. A round that is still running when the next is due
+  // skips it, so a slow Redis can't pile rounds up.
+  const { rebalance } = options;
+  let rebalancing: Promise<void> | undefined;
+  let rebalanceState: RebalanceState | undefined;
+  const rebalanceTimer = rebalance
+    ? setInterval(() => {
+        rebalancing ??= rebalanceRound(rebalance)
+          .catch((error: unknown) => {
+            log.warn({ err: error }, 'rebalancing round failed');
+          })
+          .finally(() => {
+            rebalancing = undefined;
+          });
+      }, rebalance.everyMs)
+    : undefined;
+
+  async function rebalanceRound(settings: NonNullable<GatewayOptions['rebalance']>) {
+    const loads = await settings.board.report(gatewayId, connections.size);
+    if (draining) return;
+    const decision = planRebalance({
+      gatewayId,
+      loads,
+      settings: settings.settings,
+      ...(rebalanceState && { previous: rebalanceState }),
+    });
+    rebalanceState = decision;
+    if (decision.shedding !== shedding) {
+      log.info(
+        { connections: connections.size, fairShare: Math.round(decision.fairShare) },
+        decision.shedding ? 'over the fair share: shedding connections' : 'back to the fair share',
+      );
+    }
+    shedding = decision.shedding;
+    // Close them evenly across most of the round. Their chargers reconnect through the Service.
+    const victims = [...connections.values()].slice(0, decision.shed);
+    const gapMs = (0.8 * settings.everyMs) / Math.max(1, victims.length);
+    for (const [i, connection] of victims.entries()) {
+      if (i > 0) await sleep(gapMs);
+      if (draining) return;
+      shedConnections += 1;
+      connection.close(1013, 'rebalancing: please reconnect');
+    }
+  }
+
   const handleSuperseded = (notice: SupersededNotice): void => {
     const connection = connections.get(notice.chargePointId);
     if (connection && connectionIds.get(connection) === notice.connectionId) {
@@ -249,8 +363,26 @@ export function createGateway(options: GatewayOptions): Gateway {
         });
       });
     },
-    close: async () => {
-      for (const connection of connections.values()) {
+    close: async ({ drainMs = 0 } = {}) => {
+      draining = true;
+      clearInterval(rebalanceTimer);
+      // Off the board at once, so the other gateways stop counting this one in the fair share.
+      // Both steps talk to Redis, so each gets at most one round: if Redis is down, draining
+      // must not wait for it.
+      if (rebalance) {
+        const round = sleep(rebalance.everyMs);
+        await Promise.race([rebalancing, round]);
+        const leaving = rebalance.board.remove(gatewayId).catch((error: unknown) => {
+          log.warn({ err: error }, 'could not leave the load board');
+        });
+        await Promise.race([leaving, sleep(rebalance.everyMs)]);
+      }
+      // Still listening while draining: /readyz says so, and a charger that arrives now gets a
+      // clear 503 instead of a refused connection.
+      const open = [...connections.values()];
+      const gapMs = open.length > 1 ? drainMs / (open.length - 1) : 0;
+      for (const [i, connection] of open.entries()) {
+        if (i > 0 && gapMs > 0) await sleep(gapMs);
         connection.close(1001, 'gateway shutting down');
       }
       wss.close();

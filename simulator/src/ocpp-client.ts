@@ -25,8 +25,11 @@ export interface ClientOptions {
    * OcppCallError to answer with a CALLERROR. Without it, every command gets NotImplemented.
    */
   onCall?: (action: string, payload: Payload) => Promise<Payload>;
-  /** Called once the connection has closed, whoever closed it. */
-  onClose?: () => void;
+  /**
+   * Called once the connection has closed, whoever closed it, with the WebSocket close code: 1006
+   * when it simply broke (a crashed gateway), or the gateway's own code if it closed it.
+   */
+  onClose?: (code: number) => void;
 }
 
 /** The gateway answered the WebSocket upgrade with an HTTP error instead of a socket. */
@@ -79,9 +82,9 @@ export class OcppClient {
     ws.on('message', (data: RawData) => {
       this.#receive(Buffer.isBuffer(data) ? data.toString('utf8') : '');
     });
-    ws.on('close', () => {
+    ws.on('close', (code: number) => {
       this.#fail(new Error('connection closed'));
-      options.onClose?.();
+      options.onClose?.(code);
     });
     // A gateway killed mid-conversation resets the connection. Without a listener, that 'error'
     // event would crash the whole simulator; with one, the waiting call fails and is retried.
@@ -143,6 +146,11 @@ export class OcppClient {
   }
 
   #send(action: string, payload: Payload): Promise<Payload> {
+    // A socket the gateway has closed (draining, rebalancing) would swallow the frame without a
+    // word, and the call would sit out its whole timeout. Fail at once, so the charger reconnects.
+    if (this.#ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error(`connection closed; ${action} not sent`));
+    }
     // Sequential IDs: unique within this connection, which is all OCPP-J asks for (D-006).
     const messageId = String(this.#nextMessageId++);
     return new Promise((resolve, reject) => {

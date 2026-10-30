@@ -33,6 +33,10 @@
     "cap": "node --env-file-if-exists=.env tests/e2e/run-cap-check.ts",
     "storm": "node --env-file-if-exists=.env tests/e2e/run-storm.ts",
     "replay": "node --env-file-if-exists=.env tests/e2e/replay-cli.ts",
+    "kind:up": "node scripts/kind/up.ts",
+    "kind:down": "node scripts/kind/down.ts",
+    "kind:faults": "node scripts/kind/run.ts faults",
+    "kind:storm": "node scripts/kind/run.ts storm",
     "ocpp:types": "node packages/ocpp/scripts/generate-types.ts && prettier --write packages/ocpp/src/v16/types.generated.ts"
   },
   "devDependencies": {

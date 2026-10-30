@@ -1,0 +1,7 @@
+# Everything Voltline runs lives in this namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: voltline
+  labels:
+    app.kubernetes.io/part-of: voltline

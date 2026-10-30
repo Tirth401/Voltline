@@ -1,0 +1,159 @@
+# The OCPP gateways: three interchangeable pods behind one Service. Chargers connect to
+# ws://gateway:9220/ocpp/{chargePointId}; the Service picks a ready pod for each new connection.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: voltline
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      # A rolling restart adds a new pod before it drains an old one, so capacity never drops.
+      maxSurge: 1
+      maxUnavailable: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gateway
+        app.kubernetes.io/part-of: voltline
+    spec:
+      # preStop (5 s) + draining (10 s) + flushing the frame log, with room to spare.
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gateway
+          image: voltline:dev
+          # Loaded into the kind node by `pnpm kind:up`; never pulled from a registry.
+          imagePullPolicy: Never
+          args: ['node', 'services/gateway/src/main.ts']
+          env:
+            # The pod's name identifies it in the connection registry (D-030).
+            - name: GATEWAY_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: LOG_LEVEL
+              value: info
+            # On SIGTERM, close the chargers' connections one by one over this many ms (D-037).
+            - name: SHUTDOWN_DRAIN_MS
+              value: '10000'
+            # BootNotifications per second across all gateways; over that, Pending with an
+            # appointment (D-038). A third of what one pod took in the kind trial, so a mass
+            # reconnect leaves room for the billing messages that arrive with it.
+            - name: BOOT_RATE_PER_S
+              value: '500'
+            - name: BOOT_BURST
+              value: '500'
+            # Every second, compare this gateway's share of the chargers with the others' (D-039).
+            - name: REBALANCE_EVERY_MS
+              value: '1000'
+          ports:
+            - name: ocpp
+              containerPort: 9220
+          # Ready: listening, and not shutting down (D-037). It deliberately ignores Postgres and Redis: if
+          # either is down, every gateway would go unready at once, and the chargers would lose
+          # even the connections that still work.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: ocpp
+            periodSeconds: 2
+            timeoutSeconds: 1
+            failureThreshold: 2
+          # Alive: the event loop still answers. A gateway stuck for 30 s is restarted.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: ocpp
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          lifecycle:
+            # Deleting a pod takes it out of the Service and sends SIGTERM at the same moment. The
+            # pause gives every node time to stop sending it new connections before it closes any.
+            preStop:
+              sleep:
+                seconds: 5
+          resources:
+            requests:
+              cpu: 200m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: voltline
+spec:
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: ocpp
+      port: 9220
+      targetPort: ocpp
+---
+# The same gateways from the laptop, at ws://localhost:19220/ocpp (see deploy/kind/cluster.yaml).
+# For trying things by hand only; measurements always run inside the cluster.
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway-nodeport
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: voltline
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: gateway
+  ports:
+    - name: ocpp
+      port: 9220
+      targetPort: ocpp
+      nodePort: 30220
+---
+# Voluntary disruptions (draining a node, say) take down one gateway at a time. It doesn't stop a
+# crash or a deleted pod: those are exactly what the chaos runs do.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: gateway
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: gateway
+    app.kubernetes.io/part-of: voltline
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gateway

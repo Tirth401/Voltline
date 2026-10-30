@@ -1,0 +1,69 @@
+# The charging controller for the demo site. Exactly one per site (D-032): `Recreate` stops the old
+# pod before a new version starts. A deleted pod is replaced at once, so for a moment two can run;
+# that is safe because a fresh controller sends nothing for one lease plus the clock allowance.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: charging-controller
+  namespace: voltline
+  labels:
+    app.kubernetes.io/name: charging-controller
+    app.kubernetes.io/part-of: voltline
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: charging-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: charging-controller
+        app.kubernetes.io/part-of: voltline
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: voltline:dev
+          imagePullPolicy: Never
+          args: ['node', 'services/charging-controller/src/main.ts']
+          env:
+            - name: SITE_ID
+              value: SITE-DEMO
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres
+                  key: DATABASE_URL
+            - name: REDIS_URL
+              value: redis://redis:6379
+            - name: LOG_LEVEL
+              value: info
+          ports:
+            - name: health
+              containerPort: 9240
+          # Alive: a tick has finished recently. A controller loop that hangs is restarted.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 384Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ['ALL']

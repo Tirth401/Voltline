@@ -1,0 +1,14 @@
+# What the voltline image leaves out (deploy/Dockerfile). Docs and manifests don't change what
+# runs, so editing them doesn't rebuild the image.
+.git
+.runs
+node_modules
+coverage
+deploy
+docs
+*.log
+.env
+.DS_Store
+**/.DS_Store
+DECISIONS.md
+README.md
