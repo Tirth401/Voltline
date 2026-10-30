@@ -1,0 +1,311 @@
+# Interview preparation
+
+Use this guide to talk about Voltline with confidence. Every number here comes from a real run,
+and each one says where it comes from. If a number is not in this guide, do not quote it.
+
+**How to practise:** read a question, cover the answer, and say your answer out loud. Then compare.
+You don't need the same words. You need the same main idea and one concrete example.
+
+---
+
+## The 30-second pitch
+
+> "Voltline is a backend for electric vehicle chargers. Chargers talk to it using OCPP 1.6 over
+> WebSockets. The hard part is billing: chargers lose their connection, send messages twice, send
+> them late or in the wrong order, and sometimes their meters reset. I built the server and a
+> simulator of misbehaving chargers. With seeded fault injection, 5,000 sessions are billed
+> exactly to the watt-hour, even while gateway processes are being killed. I can also replay any
+> charger's recorded traffic to reproduce its bills."
+
+## The 2-minute walkthrough
+
+1. **The problem.** A charger reports a start, meter readings and a stop. The server works out the
+   bill. The network is unreliable, so every message can arrive twice, late or out of order.
+2. **The core rule.** The server saves each message to the database before it answers. If it
+   crashes in between, the charger sends the message again, and the server recognises the copy.
+3. **Recognising copies.** A session start is identified by the charger, connector, start time and
+   start meter reading. The charger chooses all four, so a resent copy always matches.
+4. **Working out the bill.** The bill is always recalculated from all the stored readings, sorted
+   by the charger's timestamps. It is never a running total, so duplicates and late readings
+   cannot change it by mistake.
+5. **Testing.** A simulator injects faults decided by a seed. Each test checks every session
+   against what the simulated meter can prove, and also proves the faults really happened.
+6. **Replay.** Every message is recorded. I can replay a charger into an empty database and get
+   the same bills. That needed one trick: translating the server-assigned transaction IDs.
+
+---
+
+## Numbers you can quote
+
+| Number                   | What it means                                                                                  | Source                                          |
+| ------------------------ | ---------------------------------------------------------------------------------------------- | ----------------------------------------------- |
+| 500 sessions × 3 seeds   | Milestone 2 runs, each with injected faults                                                    | `docs/results/m2-billing-under-faults.md`       |
+| 0 discrepancies          | In every run, every bill equalled what the readings prove                                      | same                                            |
+| 0 lost, 0 invented       | Every session exists exactly once in the database                                              | same                                            |
+| 41 / 47 / 52             | Late StartTransactions in seeds 1 / 2 / 3                                                      | same                                            |
+| 683 / 656 / 628          | Lost answers in seeds 1 / 2 / 3, counted per message                                           | same                                            |
+| 3.4–3.8 s                | Time for one 500-session run on my laptop (simulated time is compressed, not a benchmark)      | same                                            |
+| 56                       | Official OCPP 1.6 schema files, byte-identical to the download                                 | `pnpm prereqs`                                  |
+| 72 + 32                  | Unit tests + integration tests at the end of Milestone 2                                       | `pnpm check`, `pnpm test:integration`           |
+| 5,000 sessions × 3 seeds | Milestone 3 runs: 3 gateway processes, one killed with SIGKILL every 0.5–1.5 s                 | `docs/results/m3-billing-with-gateway-kills.md` |
+| 12 / 13 / 12             | Gateway kills in seeds 1 / 2 / 3                                                               | same                                            |
+| 377 / 421 / 392          | Times a charger's connection broke under it and it reconnected                                 | same                                            |
+| 0 / 0 / 0                | Discrepancies, lost and invented sessions, and replay mismatches, in every crash run           | same                                            |
+| 377 then 402             | Reconnects in two runs of the same seed: only timing changed; faults and energy were identical | same                                            |
+| 3.5 s → 4.8 s            | What the group commit cost on the 500-session run                                              | `DECISIONS.md` D-023                            |
+| 80 + 45                  | Unit tests + integration tests during Milestone 3                                              | `pnpm check`, `pnpm test:integration`           |
+
+---
+
+## Questions and answers
+
+### The protocol
+
+**Q: What is OCPP, and why version 1.6?**
+OCPP is the open standard that chargers and backends use to talk. Version 1.6 is still the most
+widely deployed. Version 2.0.1 is not just an upgrade: it changes how transactions work and adds
+a large device model. Doing both in one semester would make everything shallow, so 2.0.1 is a
+stretch goal.
+
+**Q: How does a charger connect?**
+It opens a WebSocket to `/ocpp/{its-id}` and asks for the `ocpp1.6` subprotocol. If the ID is not
+registered, the gateway refuses before the WebSocket even opens (HTTP 404). If the charger does
+not speak `ocpp1.6`, it is refused with HTTP 400.
+
+**Q: What does a message look like?**
+A JSON array. A request is `[2, messageId, action, payload]`. A success answer is
+`[3, messageId, payload]`. An error is `[4, messageId, errorCode, description, details]`. The
+message ID links an answer to its request.
+
+**Q: Why handle one message at a time per charger?**
+Order matters. The StartTransaction must be saved before the first meter reading of that session
+is handled. But answers to our own requests skip that queue. Otherwise, a handler that waits for
+the charger's answer would wait behind itself forever.
+
+**Q: How do you validate messages?**
+Against the official JSON schemas from the Open Charge Alliance. Failures map to OCPP error
+codes: a missing field is `OccurenceConstraintViolation`, which is the spec's own misspelling.
+TypeScript types are generated from the same schemas, so code and validation cannot disagree.
+
+### Billing correctness
+
+**Q: The charger sends StartTransaction twice. How do you avoid two sessions?**
+The session has a unique key: charger, connector, start time and start meter reading. The second
+insert hits that key, so the server finds the existing session and returns the same
+transactionId. Two different real sessions cannot share all four values.
+
+**Q: Why not use the OCPP message ID as the duplicate key?**
+OCPP only requires message IDs to be unique within one connection. The retries that matter happen
+after a reconnect, and the charger may give the resent message a new ID.
+
+**Q: Why not use the time the server received the message?**
+Because a charger that was offline sends its messages late. The session started when the charger
+says it did, not when we heard about it.
+
+**Q: Why store energy as integers?**
+Decimal numbers are inexact in binary. In JavaScript, `0.1 + 0.2` is `0.30000000000000004`.
+Energy is money, so we store whole watt-hours and parse meter strings exactly, without floats.
+
+**Q: A meter reading arrives after the session has stopped. What happens?**
+We save it, and if the session is already stopped, we work out its bill again from all the
+evidence. To make that safe when the stop and the reading arrive at the same moment, the reading
+is committed first, and then we lock the session's row. Whatever the timing, one of them sees the
+other. A test runs that race 20 times.
+
+**Q: How do you handle meter resets? Can you always detect them?**
+No, not always, and that is an important point. A reset is visible only if the next reading is
+lower than the last one. If the meter resets and then climbs past the old value before the next
+reading, the readings look like normal growth. So we bill what the readings can prove: we may
+undercharge in that case, but we never overcharge. Chargers that report a reading just before
+and just after a reboot make every reset visible.
+
+**Q: What does "zero discrepancies" mean exactly?**
+The bill equals the energy that the charger's readings can prove. It is not "the bill equals the
+energy that physically flowed", because energy hidden by an unreported reset cannot be proved by
+anyone. We report that gap separately: between 3,514 Wh and 5,186 Wh per 500-session run.
+
+### Reliability
+
+**Q: What if the gateway crashes after saving a message but before answering?**
+The charger never gets the answer, so it sends the message again. The duplicate key and the
+"insert or do nothing" writes absorb the copy. Nothing is lost and nothing is counted twice.
+
+**Q: Why not answer with an error when you don't know a transaction?**
+In OCPP 1.6, a charger may delete a transaction message after several error answers. An error
+for "unknown transaction" could quietly delete billing data. So we save it, flag it and answer OK.
+
+**Q: How do you find connections that died silently?**
+The gateway pings each WebSocket every 30 seconds. If the last ping got no pong, it closes the
+socket. Without this, a charger that lost power could look connected forever.
+
+### Testing
+
+**Q: Your tests are random. How do you reproduce a failure?**
+Every random choice comes from a seeded generator, so the same seed gives the same scenario. But
+a seed cannot control network timing. So the gateway also records every message, and I can
+replay a charger's real traffic into an empty database. Seeds reproduce the scenario; recordings
+reproduce the run.
+
+**Q: How do you know a fault test is not passing by accident?**
+Each test run counts the faults that actually happened and fails if any kind is zero. A chaos
+test that injects nothing proves nothing.
+
+**Q: What is property-based testing, and where did you use it?**
+Instead of one example, you state a rule and the library tries hundreds of random inputs. For
+example: "dropping, duplicating or shuffling the readings never changes the bill". When a case
+fails, the library shrinks it to the smallest failing example and prints its seed.
+
+**Q: Why did your replay need transaction-ID translation?**
+In OCPP 1.6 the server assigns transaction IDs. A replay into a new database gives out new IDs in
+a different order, so the recorded stops pointed at the wrong sessions. My first replay got
+almost every bill wrong. The fix reads the server's recorded answer to each StartTransaction and
+translates old IDs to new ones. The lesson works for any system: if the server assigns IDs,
+replay must translate them.
+
+**Q: Why did you write your own simulator instead of using an existing one?**
+Because I need ground truth. My simulator knows exactly how much energy flowed and which readings
+it sent, so every bill can be checked to the watt-hour. Later, I will also test against SAP's
+open-source charger simulator, to check that we work with code I did not write.
+
+### Crashes and several gateways
+
+**Q: How did you test that billing survives server crashes?**
+I run three gateway processes. A seeded chaos loop kills one with SIGKILL every 0.5 to 1.5 seconds
+and restarts it shortly after. 100 simulated chargers run 5,000 sessions through them. Across
+three seeds there were 12 or 13 kills per run and about 400 broken connections, and every run had
+zero discrepancies, with no session lost or invented.
+
+**Q: Why SIGKILL and not a normal shutdown?**
+SIGKILL is a real crash: the process gets no chance to close sockets, finish database
+transactions or flush buffers. It is like a power cut. A polite SIGTERM lets the program tidy up,
+which hides exactly the bugs I want to find.
+
+**Q: What happens to a message the gateway was handling when it died?**
+There are two cases, and both are safe. If the gateway saved the message but died before
+answering, the charger never got an answer, so it sends the message again. The duplicate key
+recognises the copy. If the gateway died before saving, nothing was saved, and the resent copy is
+saved normally. Either way the result is exactly one record.
+
+**Q: How do chargers reconnect without overloading the server?**
+With exponential backoff and jitter. After each failed try, the longest wait doubles, from 50 ms
+up to 2 s, and the real wait is a random time below it. The randomness spreads the chargers out,
+so they don't all hit the next gateway at the same instant.
+
+**Q: Your tests are seeded. Do they stay reproducible when there are crashes?**
+The charger's behaviour does, yes. Crash timing cannot be seeded, so the network choices
+(reconnects and backoff waits) use a separate random stream. I reran the same seed with crashes:
+the faults and the energy were identical, and only the reconnect count changed, from 377 to 402.
+
+**Q: How do you keep your recording complete if a process can die at any moment?**
+Group commit. The gateway sends an answer only after the frame log has stored the message and
+the answer. All connections share each write, so it costs a few milliseconds, not throughput. So
+if a charger got an answer, the message is in the log. If it didn't, the charger resends it and the
+copy is logged. In my 500-session run this took the time from 3.5 s to 4.8 s.
+
+**Q: With several gateways, how does a command find the right charger?**
+A Redis registry records which gateway holds each charger's connection. The API looks it up and
+publishes the command on that gateway's Redis channel. The gateway sends it over the WebSocket,
+checks the charger's answer against the official schema, and publishes the reply back. If nobody
+receives the published message, that gateway has died, and the API answers "not connected" at once.
+
+**Q: Why not use a message queue such as Kafka for commands?**
+Because a command delivered late is worse than one that fails. If "start charging" arrives a
+minute later, the driver may have left. With a timeout, the caller always knows within seconds
+whether it worked, and can retry with fresh information.
+
+**Q: What if a charger reconnects to a new gateway while its old socket still looks open?**
+When the new gateway registers the charger, the registry returns the previous owner, and that
+gateway is told to close the old socket. A connection only removes itself from the registry if it
+is still the owner, so an old socket closing late cannot erase the new one.
+
+### Smart charging
+
+**Q: How do you keep a site under its power cap?**
+Every connector keeps a small default limit, and the rest of the cap is shared fairly between
+the cars that want more ("water filling"). Limits change in a safe order: decreases first, and
+increases only after the decreases are confirmed, and only into power that is free even in the
+worst case.
+
+**Q: Why reserve power for an empty connector?**
+Because a car can plug in and start drawing the connector's default limit before the backend
+reacts. If we gave that power away, a new car arriving could push the site over its cap.
+
+**Q: Why decreases before increases? Can you give an example?**
+Cap 18,280 W, two connectors with a 4,140 W default. Car A alone has 14,140 W. Car B arrives,
+and the fair split is 9,140 W each. If I raised B first, for a moment the site could draw
+14,140 + 9,140 = 23,280 W. So A goes down first, and B goes up only after A's charger confirms.
+
+**Q: What if a charger never answers a decrease?**
+Then I don't know which limit it is using, so I count the higher one. That is the worst case.
+Increases only use power that is still free in the worst case, so nothing that depends on the
+missing answer is sent. A lease (`validTo`) on each limit means a charger that went silent falls
+back to its default on its own.
+
+**Q: How do you know the safety test isn't trivially true?**
+A controller that gives everyone zero would never break the cap. So a second property test
+checks that once chargers answer again, every connector reaches its fair target. Safety and
+usefulness are tested together.
+
+**Q: What does "level-triggered" mean, and why use it?**
+The controller works out the next changes from the current state alone, not from the list of
+events that led there. If an event is lost or repeated, the next run still computes the right
+thing. Kubernetes controllers work the same way.
+
+### Design choices
+
+**Q: Why is billing inside the gateway and not a separate service?**
+The key rule is "save, then answer". A network call to a billing service between those two steps
+adds a new way to fail, and it does not help any of our goals. I split out services only for a
+real operational reason.
+
+**Q: Why no ORM?**
+Correct billing depends on exact SQL: `INSERT … ON CONFLICT`, row locks and transaction
+boundaries. An ORM hides exactly those details. TimescaleDB tables also need raw SQL.
+
+**Q: Why TimescaleDB?**
+Meter readings are time series. TimescaleDB stores them in time-based chunks and keeps normal
+Postgres SQL. We only needed one rule from it: every unique index must include the time column,
+and our duplicate key already does.
+
+---
+
+## Be honest about limitations
+
+Saying these yourself makes you more convincing, not less.
+
+- The crashes so far are of processes on one machine, not pods in Kubernetes. That comes in
+  Milestone 4. Only gateways crash; Postgres and Redis stay up. There are no network partitions
+  yet: a gateway is either fully up or dead.
+- The faults come from my own model of an OCPP 1.6 charger. Real firmware varies. Testing with
+  SAP's simulator comes later.
+- Simulated time is compressed. The run times show how long a test takes on my laptop. They are
+  not performance results.
+- Energy hidden by an unreported meter reset is not billed. That is a choice, and we report it.
+
+---
+
+## Glossary
+
+| Term                   | Meaning                                                                                               |
+| ---------------------- | ----------------------------------------------------------------------------------------------------- |
+| CSMS                   | Charge Station Management System: the server that chargers talk to.                                   |
+| OCPP                   | Open Charge Point Protocol: the standard language between chargers and the CSMS.                      |
+| WebSocket              | A network connection that stays open, so both sides can send messages at any time.                    |
+| Session / transaction  | One charging session, from StartTransaction to StopTransaction.                                       |
+| idTag                  | The ID of the card or app that started the session.                                                   |
+| Wh, kWh                | Watt-hour and kilowatt-hour: units of energy. 1 kWh = 1,000 Wh.                                       |
+| Meter register         | The meter's running total of energy, like the odometer in a car.                                      |
+| Idempotent             | Safe to do twice: the second time changes nothing.                                                    |
+| At-least-once delivery | A message may arrive more than once, but it is never lost.                                            |
+| Duplicate key          | The values that identify "the same thing", so a copy can be recognised.                               |
+| Seed                   | The starting number for a random generator. The same seed gives the same choices.                     |
+| Property-based test    | A test that checks a rule against many generated inputs.                                              |
+| Replay                 | Feeding recorded messages into a fresh system to reproduce a past run.                                |
+| Row lock               | A database lock on one row, so two operations on it take turns.                                       |
+| Gateway                | The server process that holds the chargers' WebSocket connections.                                    |
+| SIGKILL                | A signal that stops a process immediately, with no chance to clean up: a realistic crash.             |
+| Backoff and jitter     | Waiting longer after each failed retry (backoff), by a random amount (jitter), so retries spread out. |
+| Group commit           | Many writers waiting for one shared database write, which makes the guarantee cheap.                  |
+| Pub/sub                | Publish/subscribe: a message sent on a named channel reaches whoever is listening on it right now.    |
+| Registry               | Here, the Redis record of which gateway holds each charger's connection.                              |
+| Epoch                  | A counter that grows with each new connection of a charger, so newer can be told from older.          |

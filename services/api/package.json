@@ -1,0 +1,17 @@
+{
+  "name": "@voltline/api",
+  "version": "0.0.0",
+  "private": true,
+  "description": "REST API: connector status, sessions and bills, and commands to chargers",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@voltline/availability": "workspace:*",
+    "@voltline/db": "workspace:*",
+    "@voltline/routing": "workspace:*",
+    "ioredis": "6.0.0",
+    "pino": "10.4.0"
+  }
+}

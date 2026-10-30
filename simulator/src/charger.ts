@@ -1,5 +1,12 @@
+import { setTimeout as sleep } from 'node:timers/promises';
 import { ManualClock, Prng } from '@voltline/common';
-import type { Payload, V16ChargerAction, V16Request, V16Validator } from '@voltline/ocpp';
+import {
+  OcppCallError,
+  type Payload,
+  type V16ChargerAction,
+  type V16Request,
+  type V16Validator,
+} from '@voltline/ocpp';
 import {
   NO_FAULTS,
   planSession,
@@ -8,11 +15,14 @@ import {
   type SessionPlan,
 } from './faults.ts';
 import { Meter } from './meter.ts';
-import { OcppClient } from './ocpp-client.ts';
+import { ConnectionRefusedError, OcppClient } from './ocpp-client.ts';
 
 export interface ChargerOptions {
-  /** e.g. ws://127.0.0.1:9220/ocpp. The charger appends its own identity. */
-  gatewayUrl: string;
+  /**
+   * e.g. ws://127.0.0.1:9220/ocpp; the charger appends its own identity. With several, each
+   * connection picks one at random, as a load balancer in front of several gateways would.
+   */
+  gatewayUrl: string | readonly string[];
   chargePointId: string;
   idTag: string;
   /** This charger's own random stream: every choice it makes comes from here (D-011). */
@@ -20,6 +30,11 @@ export interface ChargerOptions {
   faults?: FaultProfile;
   /** Where the charger's virtual clock starts. */
   startTime?: Date;
+  /**
+   * Real milliseconds each simulated minute of charging takes. 0 (the default) runs as fast as
+   * possible; tests of remote commands slow it down so a session is still running when they act.
+   */
+  realMsPerMinute?: number;
   /** Check both directions of every message against the official schemas. */
   validator?: V16Validator;
 }
@@ -52,6 +67,8 @@ export interface SessionTruth {
     reset?: 'reported' | 'unreported';
     lostResponses: number;
     droppedAfterSend: number;
+    /** Times the connection broke under the charger (a gateway crashed) and it reconnected. */
+    reconnects: number;
   };
   /** The exact payloads sent, so tests can resend them. */
   startRequest: V16Request<'StartTransaction'>;
@@ -75,6 +92,11 @@ interface Queued {
 const CONNECTOR_ID = 1;
 const MINUTE_MS = 60_000;
 const MAX_ATTEMPTS = 25;
+// Reconnecting after gateway crashes: up to 2 s between tries, and about two minutes in all.
+const MAX_TRANSPORT_FAILURES = 60;
+const MAX_CONNECT_FAILURES = 60;
+const BASE_BACKOFF_MS = 50;
+const MAX_BACKOFF_MS = 2_000;
 const DEFAULT_START = new Date('2026-01-01T08:00:00Z');
 
 /**
@@ -96,10 +118,27 @@ export class SimulatedCharger {
   #online = true;
   #outbox: Queued[] = [];
   #status: ConnectorStatus = 'Available';
-  readonly #counts = { lostResponses: 0, droppedAfterSend: 0 };
+  readonly #counts = { lostResponses: 0, droppedAfterSend: 0, reconnects: 0 };
+  #sessionCount = 0;
+  // Remote mode (D-030): commands from the CSMS start and stop sessions.
+  #serving = false;
+  #busy = false;
+  #stopRequested = false;
+  #currentTransactionId: number | undefined;
+  readonly #remoteSessions: Promise<SessionTruth>[] = [];
+  /**
+   * Network choices (which gateway, how long to back off) come from a separate stream. They
+   * depend on how often gateways crash, which a seed can't control; keeping them apart means the
+   * charger's own behaviour stays exactly reproducible from the seed regardless (D-011).
+   */
+  readonly #net: Prng;
+  readonly #gatewayUrls: readonly string[];
 
   constructor(options: ChargerOptions) {
     this.#options = options;
+    this.#net = options.rng.fork('network');
+    this.#gatewayUrls =
+      typeof options.gatewayUrl === 'string' ? [options.gatewayUrl] : options.gatewayUrl;
     this.#rng = options.rng;
     this.#faults = options.faults ?? NO_FAULTS;
     this.#clock = new ManualClock(options.startTime ?? DEFAULT_START);
@@ -110,17 +149,10 @@ export class SimulatedCharger {
   async run(sessions: number): Promise<SessionTruth[]> {
     const truths: SessionTruth[] = [];
     try {
-      const boot = (await this.#send('BootNotification', {
-        chargePointVendor: 'Voltline',
-        chargePointModel: 'SimCharger',
-        firmwareVersion: '0.1.0',
-      })) as { status: string };
-      if (boot.status !== 'Accepted') throw new Error(`BootNotification was ${boot.status}`);
-      await this.#send('Heartbeat', {});
-      await this.#reportStatus(0, 'Available');
-      await this.#reportStatus(CONNECTOR_ID, 'Available');
-      for (let index = 0; index < sessions; index++) {
-        truths.push(await this.#runSession(index));
+      await this.#boot();
+      for (let i = 0; i < sessions; i++) {
+        const start = { idTag: this.#options.idTag, remote: false };
+        truths.push(await this.#runSession(this.#sessionCount++, start));
         this.#clock.advance(this.#rng.int(1, 30) * MINUTE_MS); // idle until the next car
       }
     } finally {
@@ -129,8 +161,100 @@ export class SimulatedCharger {
     return truths;
   }
 
-  async #runSession(index: number): Promise<SessionTruth> {
-    const { chargePointId, idTag } = this.#options;
+  /**
+   * Remote mode: boots, then waits for commands from the CSMS instead of running scripted
+   * sessions. RemoteStartTransaction starts a session and RemoteStopTransaction ends it (D-030).
+   * Call finish() when done.
+   */
+  async serve(): Promise<void> {
+    await this.#boot();
+    this.#serving = true;
+  }
+
+  /** Waits for every remotely started session to end, hangs up, and returns what they did. */
+  async finish(): Promise<SessionTruth[]> {
+    this.#serving = false;
+    try {
+      return await Promise.all(this.#remoteSessions);
+    } finally {
+      await this.#client?.close();
+      this.#client = undefined;
+    }
+  }
+
+  async #boot(): Promise<void> {
+    const boot = (await this.#send('BootNotification', {
+      chargePointVendor: 'Voltline',
+      chargePointModel: 'SimCharger',
+      firmwareVersion: '0.1.0',
+    })) as { status: string };
+    if (boot.status !== 'Accepted') throw new Error(`BootNotification was ${boot.status}`);
+    await this.#send('Heartbeat', {});
+    await this.#reportStatus(0, 'Available');
+    await this.#reportStatus(CONNECTOR_ID, 'Available');
+  }
+
+  /** Answers a command from the CSMS. It runs alongside whatever the charger is doing. */
+  #answerCommand(action: string, payload: Payload): Promise<Payload> {
+    switch (action) {
+      case 'TriggerMessage': {
+        const requested = payload['requestedMessage'];
+        if (requested !== 'Heartbeat' && requested !== 'StatusNotification') {
+          return Promise.resolve({ status: 'NotImplemented' });
+        }
+        // Answer first; the triggered message follows once the answer is out.
+        setImmediate(() => {
+          void this.#sendTriggered(requested);
+        });
+        return Promise.resolve({ status: 'Accepted' });
+      }
+      case 'RemoteStartTransaction': {
+        if (!this.#serving || this.#busy) return Promise.resolve({ status: 'Rejected' });
+        const idTag = String(payload['idTag']);
+        this.#busy = true; // claim the connector now, so a second start is turned down
+        this.#remoteSessions.push(
+          sleep(0).then(() => this.#runSession(this.#sessionCount++, { idTag, remote: true })),
+        );
+        return Promise.resolve({ status: 'Accepted' });
+      }
+      case 'RemoteStopTransaction': {
+        if (!this.#busy || payload['transactionId'] !== this.#currentTransactionId) {
+          return Promise.resolve({ status: 'Rejected' });
+        }
+        this.#stopRequested = true;
+        return Promise.resolve({ status: 'Accepted' });
+      }
+      default:
+        return Promise.reject(new OcppCallError('NotImplemented', `${action} is not simulated`));
+    }
+  }
+
+  /** Sends a message the CSMS asked for. Best effort, and outside the seeded script. */
+  async #sendTriggered(requested: 'Heartbeat' | 'StatusNotification'): Promise<void> {
+    const client = this.#client;
+    if (!client) return;
+    const payload =
+      requested === 'Heartbeat'
+        ? {}
+        : {
+            connectorId: CONNECTOR_ID,
+            errorCode: 'NoError',
+            status: this.#status,
+            timestamp: this.#clock.now().toISOString(),
+          };
+    await client.callPayload(requested, payload).catch(() => undefined);
+  }
+
+  async #runSession(
+    index: number,
+    start: { idTag: string; remote: boolean },
+  ): Promise<SessionTruth> {
+    const { chargePointId } = this.#options;
+    const { idTag } = start;
+    this.#busy = true;
+    this.#stopRequested = false;
+    this.#currentTransactionId = undefined;
+    const realMsPerMinute = this.#options.realMsPerMinute ?? 0;
     const plan = planSession(this.#rng, this.#faults);
     const countsBefore = { ...this.#counts };
     let transactionId: number | undefined;
@@ -170,7 +294,8 @@ export class SimulatedCharger {
 
     // Step 0: the car plugs in and the session starts.
     await this.#beforeStep(plan, 0);
-    if (this.#online) {
+    // A remote start skips Authorize: the CSMS already chose the tag (AuthorizeRemoteTxRequests off).
+    if (this.#online && !start.remote) {
       await this.#reportStatus(CONNECTOR_ID, 'Preparing');
       const { idTagInfo } = (await this.#send('Authorize', { idTag })) as {
         idTagInfo: { status: string };
@@ -192,6 +317,7 @@ export class SimulatedCharger {
         const id = (answer as { transactionId: number }).transactionId;
         transactionIdsSeen.push(id);
         transactionId ??= id;
+        this.#currentTransactionId ??= id;
       },
     });
     this.#status = 'Charging';
@@ -199,6 +325,7 @@ export class SimulatedCharger {
 
     // Steps 1…minutes: charge, with a meter reading every minute.
     for (let minute = 1; minute <= plan.minutes; minute++) {
+      if (this.#stopRequested) break; // RemoteStopTransaction: end the session now
       await this.#beforeStep(plan, minute);
       this.#clock.advance(MINUTE_MS);
       this.#chargeFor(plan, MINUTE_MS);
@@ -224,11 +351,17 @@ export class SimulatedCharger {
         }
       }
       await this.#afterStep(plan, minute);
+      if (realMsPerMinute > 0) await sleep(realMsPerMinute);
     }
+
+    // A remote stop ends the session early: drop the rest of any offline spell, catch up first.
+    const remaining = this.#stopRequested ? { ...plan, offline: undefined } : plan;
+    if (this.#stopRequested && !this.#online) await this.#reconnect(plan.shuffleOnReconnect);
+    const reason = this.#stopRequested ? ('Remote' as const) : ('EVDisconnected' as const);
 
     // Step minutes + 1: the car leaves and the session stops.
     const stopStep = plan.minutes + 1;
-    await this.#beforeStep(plan, stopStep);
+    await this.#beforeStep(remaining, stopStep);
     this.#clock.advance(MINUTE_MS);
     this.#chargeFor(plan, MINUTE_MS);
     const meterStop = this.#meter.emit();
@@ -242,7 +375,7 @@ export class SimulatedCharger {
           idTag,
           meterStop,
           timestamp: stoppedAt.toISOString(),
-          reason: 'EVDisconnected' as const,
+          reason,
           transactionData: [
             {
               timestamp: stoppedAt.toISOString(),
@@ -258,15 +391,17 @@ export class SimulatedCharger {
       },
     });
     this.#status = 'Available';
-    await this.#afterStep(plan, stopStep);
+    await this.#afterStep(remaining, stopStep);
 
     // Step minutes + 2: if the charger was still offline, it reconnects now and catches up.
-    await this.#beforeStep(plan, stopStep + 1);
-    await this.#afterStep(plan, stopStep + 1);
+    await this.#beforeStep(remaining, stopStep + 1);
+    await this.#afterStep(remaining, stopStep + 1);
 
     if (this.#outbox.length > 0 || transactionId === undefined || stopRequest === undefined) {
       throw new Error(`bug: session ${index} of ${chargePointId} ended with messages undelivered`);
     }
+    this.#busy = false;
+    this.#currentTransactionId = undefined;
     return {
       chargePointId,
       connectorId: CONNECTOR_ID,
@@ -289,6 +424,7 @@ export class SimulatedCharger {
         ...(reset && { reset }),
         lostResponses: this.#counts.lostResponses - countsBefore.lostResponses,
         droppedAfterSend: this.#counts.droppedAfterSend - countsBefore.droppedAfterSend,
+        reconnects: this.#counts.reconnects - countsBefore.reconnects,
       },
       startRequest,
       meterValuesRequests,
@@ -357,14 +493,12 @@ export class SimulatedCharger {
     onAnswer?: (answer: Payload) => void,
   ): Promise<Payload> {
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      const client = await this.#connected();
       if (this.#rng.chance(this.#faults.dropAfterSend)) {
         this.#counts.droppedAfterSend += 1;
-        this.#client = undefined;
-        await client.sendThenClose(action, payload);
+        await this.#deliver(action, payload, 'hang up after sending');
         continue;
       }
-      const answer = await client.callPayload(action, payload);
+      const answer = await this.#deliver(action, payload, 'wait for the answer');
       onAnswer?.(answer);
       if (this.#rng.chance(this.#faults.lostResponse)) {
         this.#counts.lostResponses += 1;
@@ -375,13 +509,77 @@ export class SimulatedCharger {
     throw new Error(`${action} still unanswered after ${MAX_ATTEMPTS} attempts`);
   }
 
+  /**
+   * One delivery attempt, carried out however many reconnects it takes. If the gateway dies
+   * under the charger (crash, restart), nothing is lost: it reconnects, possibly to another
+   * gateway, and sends the same message again. No fault draws happen here, so crashes can't
+   * shift the charger's seeded behaviour.
+   */
+  async #deliver(
+    action: V16ChargerAction,
+    payload: Payload,
+    mode: 'wait for the answer' | 'hang up after sending',
+  ): Promise<Payload> {
+    for (let failures = 0; ; failures++) {
+      const client = await this.#connected();
+      try {
+        if (mode === 'hang up after sending') {
+          this.#client = undefined;
+          await client.sendThenClose(action, payload);
+          return {};
+        }
+        return await client.callPayload(action, payload);
+      } catch (error) {
+        // The gateway answered with an OCPP error: that's a bug to surface, not a network fault.
+        if (error instanceof OcppCallError) throw error;
+        this.#client = undefined;
+        this.#counts.reconnects += 1;
+        if (failures >= MAX_TRANSPORT_FAILURES) {
+          throw new Error(`${action} failed on ${failures + 1} connections in a row`, {
+            cause: error,
+          });
+        }
+      }
+    }
+  }
+
+  /** The current connection, or a new one, retried with backoff while no gateway accepts. */
   async #connected(): Promise<OcppClient> {
     if (!this.#online) throw new Error('bug: tried to send while offline');
-    this.#client ??= await OcppClient.connect(
-      `${this.#options.gatewayUrl}/${encodeURIComponent(this.#options.chargePointId)}`,
-      this.#options.validator ? { validator: this.#options.validator } : {},
-    );
+    for (let failures = 0; this.#client === undefined; failures++) {
+      const url =
+        this.#gatewayUrls.length === 1
+          ? (this.#gatewayUrls[0] as string)
+          : this.#net.pick(this.#gatewayUrls);
+      try {
+        this.#client = await OcppClient.connect(
+          `${url}/${encodeURIComponent(this.#options.chargePointId)}`,
+          {
+            ...(this.#options.validator && { validator: this.#options.validator }),
+            onCall: (action, payload) => this.#answerCommand(action, payload),
+          },
+        );
+      } catch (error) {
+        // An HTTP refusal (unknown charger, wrong subprotocol) won't fix itself by retrying.
+        if (error instanceof ConnectionRefusedError) throw error;
+        if (failures >= MAX_CONNECT_FAILURES) {
+          throw new Error(`no gateway accepted a connection in ${failures + 1} tries`, {
+            cause: error,
+          });
+        }
+        await sleep(this.#backoffMs(failures));
+      }
+    }
     return this.#client;
+  }
+
+  /**
+   * Exponential backoff with full jitter: wait a random time between 0 and min(cap, base × 2^n).
+   * The randomness spreads reconnects out, so chargers whose gateway died don't all knock on the
+   * next one at the same instant.
+   */
+  #backoffMs(failures: number): number {
+    return this.#net.int(0, Math.min(MAX_BACKOFF_MS, BASE_BACKOFF_MS * 2 ** failures));
   }
 
   /** Energy flows for `ms`: the car draws 90 to 100% of the session's power each time. */

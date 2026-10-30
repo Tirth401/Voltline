@@ -5,7 +5,7 @@
 import { randomUUID } from 'node:crypto';
 import { AvailabilityStore } from '@voltline/availability';
 import { createTestRedis, deleteKeysWithPrefix } from '@voltline/availability/testing';
-import type { Queryable } from '@voltline/db';
+import type { Pool, Queryable } from '@voltline/db';
 import { createTestDatabase, type TestDatabase } from '@voltline/db/testing';
 import {
   createGateway,
@@ -118,6 +118,8 @@ export interface BillingReport {
   /** Every session with anything wrong, and what. */
   problems: SessionProblem[];
   energy: { physicalWh: number; evidencedWh: number; billedWh: number };
+  /** Times a charger's connection broke under it (a gateway crashed) and it reconnected. */
+  reconnects: number;
   /** The faults that actually happened: a run that injected none would prove nothing. */
   faults: {
     offlineSpells: number;
@@ -178,6 +180,7 @@ export async function checkBilling(
     discrepancies: 0,
     problems: [],
     energy: { physicalWh: 0, evidencedWh: 0, billedWh: 0 },
+    reconnects: 0,
     faults: {
       offlineSpells: 0,
       lateStarts: 0,
@@ -240,6 +243,7 @@ export async function checkBilling(
     if (truth.faults.reset === 'unreported') faults.resetsUnreported += 1;
     faults.lostResponses += truth.faults.lostResponses;
     faults.droppedAfterSend += truth.faults.droppedAfterSend;
+    report.reconnects += truth.faults.reconnects;
   }
   report.invented = rows.filter((row) => !matched.has(row.transaction_id)).length;
   return report;
@@ -250,25 +254,31 @@ export async function checkBilling(
  * sessions and bills with the originals (D-023). Transaction ids differ between the two databases,
  * so sessions are matched by their natural key.
  */
+export interface ReplaySource {
+  /** The database the run wrote to. Flush or stop every gateway writing frames first. */
+  db: Pool;
+  redis: Redis;
+  logger: Logger;
+}
+
 export async function replayAndCompare(
-  stack: Stack,
+  source: ReplaySource,
   chargers: readonly ChargerIdentity[],
 ): Promise<{ sessions: number; mismatches: string[] }> {
-  await stack.frameLog.flush();
   const target = await createTestDatabase();
   const redisPrefix = `voltline-replay-${randomUUID()}:`;
   try {
     await registerChargers(target.pool, chargers);
-    const availability = new AvailabilityStore(stack.redis, redisPrefix);
+    const availability = new AvailabilityStore(source.redis, redisPrefix);
     for (const { chargePointId } of chargers) {
-      const calls = await loadRecordedCalls(stack.db.pool, chargePointId);
+      const calls = await loadRecordedCalls(source.db, chargePointId);
       await replayCalls({
         chargePointId,
         calls,
         db: target.pool,
         availability,
         validator,
-        logger: stack.logger,
+        logger: source.logger,
       });
     }
 
@@ -280,7 +290,7 @@ export async function replayAndCompare(
       );
       return new Map(rows.map((row) => [row.key, row.energy_wh]));
     };
-    const original = await bills(stack.db.pool);
+    const original = await bills(source.db);
     const replayed = await bills(target.pool);
     const mismatches: string[] = [];
     for (const [key, energyWh] of original) {
@@ -296,7 +306,7 @@ export async function replayAndCompare(
     }
     return { sessions: replayed.size, mismatches };
   } finally {
-    await deleteKeysWithPrefix(stack.redis, redisPrefix);
+    await deleteKeysWithPrefix(source.redis, redisPrefix);
     await target.drop();
   }
 }

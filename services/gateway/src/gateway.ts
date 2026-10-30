@@ -6,8 +6,10 @@ import type { AvailabilityStore } from '@voltline/availability';
 import { systemClock, type Clock } from '@voltline/common';
 import type { Pool } from '@voltline/db';
 import type { V16Validator } from '@voltline/ocpp';
+import type { CommandBus, ConnectionRegistry, SupersededNotice } from '@voltline/routing';
 import type { Logger } from 'pino';
 import { WebSocketServer, type RawData, type WebSocket } from 'ws';
+import { runCommand } from './commands.ts';
 import { ChargerConnection } from './connection.ts';
 import type { FrameLog } from './frame-log.ts';
 import { createDispatcher } from './handlers.ts';
@@ -28,9 +30,17 @@ export interface GatewayOptions {
   pingIntervalMs?: number;
   /** Also check our own responses against the schemas. On in tests; costs a little CPU. */
   validateResponses?: boolean;
+  /** Names this gateway among several. Default: a random id. */
+  gatewayId?: string;
+  /**
+   * With several gateways: record which one holds each charger, take commands for our chargers,
+   * and close sockets that a charger has replaced on another gateway (D-030).
+   */
+  routing?: { registry: ConnectionRegistry; bus: CommandBus };
 }
 
 export interface Gateway {
+  readonly gatewayId: string;
   listen(port: number, host?: string): Promise<AddressInfo>;
   close(): Promise<void>;
   /** Live connections, by charger identity. */
@@ -55,6 +65,19 @@ export function createGateway(options: GatewayOptions): Gateway {
   const callTimeoutMs = options.callTimeoutMs ?? 30_000;
   const pingIntervalMs = options.pingIntervalMs ?? 30_000;
   const connections = new Map<string, ChargerConnection>();
+  const gatewayId = options.gatewayId ?? randomUUID();
+  const { routing } = options;
+  const connectionIds = new Map<ChargerConnection, string>();
+  // Registry writes still in flight; close() waits for them so nothing is left half-written.
+  const routingWrites = new Set<Promise<unknown>>();
+  const track = (write: Promise<unknown>): void => {
+    const tracked = write
+      .catch((error: unknown) => {
+        log.error({ err: error }, 'connection registry write failed');
+      })
+      .finally(() => routingWrites.delete(tracked));
+    routingWrites.add(tracked);
+  };
   const dispatch = createDispatcher({
     db: options.db,
     availability: options.availability,
@@ -129,11 +152,35 @@ export function createGateway(options: GatewayOptions): Gateway {
       ...(frameLog && {
         onFrame: (direction, raw) => {
           seq += 1;
-          frameLog.record({ chargePointId, connectionId, seq, at: clock.now(), direction, raw });
+          return frameLog.record({
+            chargePointId,
+            connectionId,
+            seq,
+            at: clock.now(),
+            direction,
+            raw,
+          });
         },
       }),
     });
     connections.set(chargePointId, connection);
+    connectionIds.set(connection, connectionId);
+
+    // Record that this gateway now holds the charger. If another gateway held it, tell that one
+    // to close its socket: the charger has given up on it (D-030).
+    const registered = routing
+      ? routing.registry
+          .register(chargePointId, { gatewayId, connectionId })
+          .then(async ({ previous }) => {
+            if (previous && previous.gatewayId !== gatewayId) {
+              await routing.bus.notifySuperseded(previous.gatewayId, {
+                chargePointId,
+                connectionId: previous.connectionId,
+              });
+            }
+          })
+      : Promise.resolve();
+    track(registered);
 
     // A charger whose network died without a goodbye leaves a socket that looks open forever.
     // Ping it regularly; if the previous ping got no pong, it's gone (D-026).
@@ -161,7 +208,12 @@ export function createGateway(options: GatewayOptions): Gateway {
     ws.on('close', (code: number) => {
       clearInterval(pinger);
       connection.closed();
+      connectionIds.delete(connection);
       if (connections.get(chargePointId) === connection) connections.delete(chargePointId);
+      // After registering, so a fast close can't leave a stale owner behind.
+      if (routing) {
+        track(registered.then(() => routing.registry.unregister(chargePointId, connectionId)));
+      }
       connectionLog.info({ code }, 'disconnected');
     });
     ws.on('error', (error: Error) => {
@@ -170,16 +222,33 @@ export function createGateway(options: GatewayOptions): Gateway {
     connectionLog.info('connected');
   }
 
+  const handleSuperseded = (notice: SupersededNotice): void => {
+    const connection = connections.get(notice.chargePointId);
+    if (connection && connectionIds.get(connection) === notice.connectionId) {
+      log.info({ chargePointId: notice.chargePointId }, 'charger moved to another gateway');
+      connection.close(1000, 'replaced by a newer connection on another gateway');
+    }
+  };
+
   return {
+    gatewayId,
     connections,
-    listen: (port, host) =>
-      new Promise((resolve, reject) => {
+    listen: async (port, host) => {
+      if (routing) {
+        await routing.bus.serve(gatewayId, {
+          command: (request) =>
+            runCommand(connections.get(request.chargePointId), request, options.validator),
+          superseded: handleSuperseded,
+        });
+      }
+      return new Promise((resolve, reject) => {
         server.once('error', reject);
         server.listen(port, host, () => {
           server.off('error', reject);
           resolve(server.address() as AddressInfo);
         });
-      }),
+      });
+    },
     close: async () => {
       for (const connection of connections.values()) {
         connection.close(1001, 'gateway shutting down');
@@ -188,6 +257,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       await new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
+      await Promise.allSettled([...routingWrites]);
     },
   };
 }

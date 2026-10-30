@@ -4,7 +4,7 @@ import { SimulatedCharger, type SessionTruth } from './charger.ts';
 import type { FaultProfile } from './faults.ts';
 
 export interface FleetOptions {
-  gatewayUrl: string;
+  gatewayUrl: string | readonly string[];
   chargers: readonly { chargePointId: string; idTag: string }[];
   /** Total sessions, spread as evenly as possible across the chargers. */
   sessions: number;

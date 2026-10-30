@@ -1,0 +1,10 @@
+{
+  "name": "@voltline/smart-charging",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Sharing a site's power cap between connectors, and changing limits without ever exceeding it",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

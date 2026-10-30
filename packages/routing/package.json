@@ -1,0 +1,13 @@
+{
+  "name": "@voltline/routing",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Which gateway holds each charger's socket, and commands routed to it over Redis",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "ioredis": "6.0.0"
+  }
+}

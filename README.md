@@ -5,10 +5,18 @@ chargers using OCPP 1.6J over WebSockets. It rebuilds the hard core of a real ch
 billing that stays exact when chargers misbehave, site power caps that are never exceeded, and
 fast recovery when the gateway restarts.
 
-> **Status:** Milestone 2 is done. With one gateway, 500 seeded sessions full of faults are billed
-> to the watt-hour, three seeds out of three: chargers go offline and send StartTransaction late,
-> lose answers, hang up mid-message, shuffle their queues, and reset their meters. Next is
-> Milestone 3: several gateways, killed mid-run. See [docs/ROADMAP.md](docs/ROADMAP.md).
+> **Status:** Milestone 3 is under way.
+>
+> - **Billing under crashes:** 5,000 seeded sessions full of faults are billed to the watt-hour
+>   while three gateway processes are killed with SIGKILL as they run (three seeds out of three).
+> - **Commands:** commands reach a charger through whichever gateway holds its connection.
+> - **Smart charging:** the core is done. It shares a site's cap fairly, and changes limits in an order
+>   that is safe at every moment (property-tested).
+> - **Next:** the controller service that sends limits to chargers, and the simulator's model of
+>   how chargers apply them.
+>
+> See [docs/ROADMAP.md](docs/ROADMAP.md). To learn how it was built, start with
+> [docs/BUILD_JOURNAL.md](docs/BUILD_JOURNAL.md).
 
 ## What we're setting out to prove
 
@@ -16,8 +24,9 @@ Each result gets a write-up in `docs/results/` with the exact command, seed, dat
 
 1. **Billing:** zero discrepancies across 5,000 simulated sessions with injected faults (offline
    periods, duplicate messages, out-of-order meter values, meter resets, gateway pod kills).
-   _So far: 500 sessions, one gateway, no kills, three seeds, zero discrepancies
-   ([write-up](docs/results/m2-billing-under-faults.md))._
+   _So far: 5,000 sessions with gateway processes killed mid-run, three seeds, zero
+   discrepancies ([write-up](docs/results/m3-billing-with-gateway-kills.md)). Pod kills in
+   Kubernetes come next._
 2. **Smart charging:** no site exceeds its power cap across 1,000 simulated load changes.
 3. **Recovery:** 2,000 simulated chargers reconnect after a gateway pod restart in Kubernetes
    (kind), measured from the chargers' side.
@@ -62,9 +71,13 @@ pnpm smoke
 
 ```bash
 pnpm faults --sessions 500 --chargers 50 --seed 1
+pnpm faults --sessions 5000 --chargers 100 --gateways 3 --chaos --seed 1
 ```
 
-This runs simulated chargers that misbehave (D-025) against a real gateway, then checks every
+The first runs one gateway inside the test process. The second starts three gateway processes and
+kills one with SIGKILL every 0.5 to 1.5 seconds while the chargers run (D-029).
+
+This runs simulated chargers that misbehave (D-025) against real gateways, then checks every
 session: billed exactly what its readings prove, stored once, and rebuilt identically by replaying
 its recorded frames into an empty database. The same seed always produces the same faults. If a
 run fails, its database schema is kept and the output prints the command to replay the failing
@@ -79,6 +92,7 @@ pnpm replay --schema <kept schema> --charger <chargePointId>
 ```bash
 pnpm db:seed
 pnpm gateway
+pnpm api
 pnpm sim --charger CP-DEMO-1 --tag TAG-DEMO-1 --seed 42
 ```
 
@@ -87,6 +101,15 @@ pnpm sim --charger CP-DEMO-1 --tag TAG-DEMO-1 --seed 42
 change it. Run `pnpm sim` in a second terminal: it prints the charger's ground truth, including
 `physicalWh` and `evidencedWh`, which you can compare with `energy_wh` in the `transactions`
 table. Copy `.env.example` to `.env` to point everything at a different database or Redis.
+
+The API listens on `http://localhost:9230`:
+
+| Request                                 | What it does                                                                                                         |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `GET /chargers/{id}`                    | The charger's details, which gateway holds it, and its connectors' live status                                       |
+| `GET /chargers/{id}/sessions`           | Its last 50 sessions, with their bills                                                                               |
+| `GET /sessions/{transactionId}`         | One session and its bill                                                                                             |
+| `POST /chargers/{id}/commands/{action}` | Sends any OCPP command the backend may send (body: the payload), through whichever gateway holds the charger (D-030) |
 
 ## Layout
 
@@ -100,16 +123,18 @@ voltline/
 │   ├── billing/              sessions: idempotent ingestion, exact energy in Wh, authorization
 │   ├── common/               seeded PRNG with named streams, injectable clock
 │   ├── db/                   SQL migrations, migration runner, per-test databases, demo seed
-│   └── ocpp/                 OCPP-J framing, the official 1.6 schemas, validation, generated types
+│   ├── ocpp/                 OCPP-J framing, the official 1.6 schemas, validation, generated types
+│   ├── routing/              which gateway holds each charger; commands over Redis pub/sub
+│   └── smart-charging/       fair power targets and a cap-safe controller step (pure functions)
 ├── services/
-│   └── gateway/              the OCPP 1.6J WebSocket server and message handlers
-├── simulator/                seeded chargers that record their own ground truth, plus a CLI
-├── tests/e2e/                simulated charger → real gateway → Postgres and Redis
+│   ├── api/                  REST: chargers, sessions and bills, commands to chargers
+│   └── gateway/              the OCPP 1.6J WebSocket server, its handlers and frame log
+├── simulator/                seeded chargers that misbehave and record their own ground truth
+├── tests/e2e/                end-to-end tests, the fault and crash harness, pnpm faults / replay
 └── scripts/                  prereqs.ts (machine check), smoke.ts (run it for real)
 ```
 
-Added as the milestones need them: `packages/smart-charging`, `services/api`,
-`services/charging-controller`, and `deploy/`.
+Added as the milestones need them: `services/charging-controller` and `deploy/`.
 
 ## Conventions
 

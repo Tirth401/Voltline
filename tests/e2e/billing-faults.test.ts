@@ -73,7 +73,9 @@ describe(`billing under faults (seed ${SEED}, ${SESSIONS} sessions, one gateway)
   });
 
   it('reproduces every bill by replaying the recorded frames into an empty database', async () => {
-    expect(await replayAndCompare(stack, chargers)).toEqual({
+    await stack.frameLog.flush();
+    const source = { db: stack.db.pool, redis: stack.redis, logger: stack.logger };
+    expect(await replayAndCompare(source, chargers)).toEqual({
       sessions: SESSIONS,
       mismatches: [],
     });

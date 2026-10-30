@@ -345,6 +345,14 @@ replay test caught it.
 **Cost.** Frames still in the buffer when a process dies are lost. That costs a trace, never money:
 billing commits its own evidence before any ack goes out (D-005).
 
+**Update (M3): the log is now a group commit.** With gateways being killed, "frames lost in a
+crash" would mean replay fails exactly when it matters most. So a gateway now sends its answer to
+a charger only after the frame log has stored the CALL and the answer. All connections share each
+write (one INSERT every few milliseconds), so it costs a few milliseconds of latency per answer,
+not throughput. Any CALL whose answer reached a charger is now always in the log. A frame lost in a
+crash belongs to a CALL the charger never got an answer for, so the charger sends it again, and
+that copy is logged. The 500-session M2 run went from 3.5 s to 4.8 s.
+
 ## D-024 · A reading that arrives after its session stopped re-bills the session
 
 _2026-10-29_
@@ -403,3 +411,89 @@ allocator moved from M2 to M3.
 **Why.** With one builder instead of four teammates working in parallel, order matters more.
 Server-initiated commands belong with cross-pod command routing (M3), and the allocator with the
 charging controller that uses it (M3). M2 stays on its exit check.
+
+## D-028 · Chargers reconnect with exponential backoff and jitter, on a separate random stream
+
+_2026-10-30_
+
+**Decision.** When a connection breaks or is refused, a simulated charger connects again, to a
+gateway picked at random from its list. Between failed tries it waits a random time between 0 and
+min(2 s, 50 ms × 2^n), where n is the number of failures so far ("full jitter"). Then it sends the
+unanswered message again. These network choices come from their own random stream, forked from
+the charger's seed by name.
+
+**Why.** Backoff stops a crowd of chargers from hammering a gateway that is starting up, and the
+jitter stops them all retrying at the same instant. The separate stream matters for testing: how
+often a charger reconnects depends on crash timing, which no seed controls. If those choices used
+the main stream, one extra reconnect would shift every later decision the charger makes. With two
+streams, a seed reproduces the chargers' behaviour exactly even under crashes: rerunning seed 1
+gave identical faults and energy, and only the reconnect count changed (377, then 402).
+
+## D-029 · Crash tests use real processes and SIGKILL, never the last gateway
+
+_2026-10-30_
+
+**Decision.** The crash tests start real gateway processes and kill them with SIGKILL on a seeded
+schedule, restarting each one shortly after, on the same port. At most one gateway is down at a
+time.
+
+**Why.** SIGKILL is the honest crash: the process gets no chance to close sockets, finish
+transactions or flush buffers, exactly like a power cut or an out-of-memory kill. A gentle
+SIGTERM would let the gateway tidy up and hide bugs. Keeping one gateway up means chargers always
+have somewhere to go, so the test measures billing correctness rather than a total outage (a total
+outage is part of the recovery test in Milestone 5).
+
+## D-030 · Commands reach a charger through a Redis registry and pub/sub, not a durable queue
+
+_2026-10-30_
+
+**Decision.** A Redis registry records which gateway holds each charger's socket, plus a counter
+(the epoch) that grows with every new connection. To send a command (RemoteStartTransaction,
+TriggerMessage…), any process looks up the owner and publishes the command on that gateway's
+Redis channel. The gateway sends it to the charger, checks the answer against the schema, and
+publishes the outcome back. When a charger connects to a new gateway, the previous owner is told
+to close its stale socket. The REST API (`services/api`) keeps no state of its own, so any number
+of copies can run.
+
+**Why.**
+
+- **Not a durable queue.** A RemoteStartTransaction delivered a minute late is worse than one that
+  fails: the driver has walked away. So a command gets an answer within a timeout, or the caller
+  is told it didn't, and can retry with fresh information.
+- **Failing fast.** If Redis reports that nobody received the published command, the gateway named
+  in the registry is dead. The caller hears "not connected" at once instead of waiting out the
+  timeout.
+- **Safe unregistering.** A connection removes itself from the registry only if it is still the
+  owner, so an old socket closing late can't erase the new one.
+
+**Known edge.** If two gateways register the same charger at almost the same moment, the last write
+wins. In the rare case where that closes the newer socket, the charger simply reconnects and
+registers again. That heals itself, so it isn't worth a distributed lock.
+
+## D-031 · Smart charging: fair targets, and a controller step that is safe at every moment
+
+_2026-10-30_
+
+**Decision.** Targets come from max-min fair "water filling" over the power left after every
+connector's default limit: each round, every car still wanting more gets an equal share. The
+controller is a pure, level-triggered function of the current state, and follows four rules:
+
+1. Decreases go first.
+2. No increase is sent while a decrease is unconfirmed.
+3. An increase only uses power that is free even in the worst case, counting changes still in
+   flight.
+4. Each connector has at most one change in flight.
+
+A site whose defaults alone exceed its cap is refused when it is configured.
+
+**Why.** "Never exceeds the cap" must hold at every moment, not just after things settle, and it
+must hold even when answers are lost, refused or late. A property test plays random sequences of
+up to 300 events against the controller: cars arriving and leaving, changes accepted, rejected or
+lost, chargers going offline, leases expiring. It checks the worst case after every single event.
+
+A second property checks that the controller always reaches its targets once chargers answer
+again. Without it, a controller that allocates nothing would pass the safety test (D-016).
+
+**Not yet.** The controller service that sends SetChargingProfile through the command bus with
+`validTo` leases, and the simulator's model of how chargers apply profiles. Both are the rest of
+M3.

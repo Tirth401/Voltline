@@ -49,19 +49,32 @@ bill reproduced by replay. Details and limitations:
 - Moved to M3 (D-027): RemoteStartTransaction, RemoteStopTransaction, TriggerMessage, and the smart-charging allocator and change planner
 - Moved to M3, as planned: settlement (active → stopped → settled)
 
-## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1
+## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1 (in progress)
 
 **Exit check:** 5,000 sessions survive gateway process kills with 0 discrepancies; a command sent
-through gateway A reaches a charger connected to gateway B; the cap holds across 200 load changes.
+through the API reaches a charger through whichever gateway holds it; the cap holds across 200
+load changes.
 
-- [ ] RemoteStartTransaction, RemoteStopTransaction, TriggerMessage (moved from M2)
-- [ ] Smart-charging allocator and change planner: pure functions, property-tested at every step of a plan (moved from M2)
-- [ ] Redis connection registry with a per-connection counter, so a stale socket on the old pod gets closed instead of used
-- [ ] Pod-to-pod commands over Redis pub/sub with a reply and a timeout (deliberately not a durable queue)
-- [ ] Graceful shutdown on SIGTERM
-- [ ] Simulator: 2,000 concurrent chargers, exponential backoff with jitter, charger-side charging profiles (stack levels, `validTo`, TxDefaultProfile fallback), applied-limit checker
+**Done so far:** the first two parts of the exit check.
+
+- **Billing under crashes:** 5,000 sessions with gateway kills, on three seeds. Every run had
+  0 discrepancies, 0 lost, 0 invented, and every bill was rebuilt by replay
+  ([results](results/m3-billing-with-gateway-kills.md)).
+- **Commands:** a command sent through the API reaches a charger on another gateway, and a charger
+  moving between gateways makes the old one close its stale socket (both tested).
+
+- [x] RemoteStartTransaction, RemoteStopTransaction and TriggerMessage, plus any other CSMS command, all checked against the schemas, through `POST /chargers/:id/commands/:action`
+- [x] Redis connection registry with a per-connection counter (the epoch); a stale socket on the old gateway is closed
+- [x] Gateway-to-gateway commands over Redis pub/sub, with a reply and a timeout (deliberately not a durable queue)
+- [x] Graceful shutdown on SIGTERM (gateway and API); connection draining comes with Kubernetes in M4
+- [x] Simulator: reconnects with exponential backoff and jitter across several gateways; remote mode, answering RemoteStart, RemoteStop and TriggerMessage
+- [x] Frame log as a group commit, so replay survives SIGKILL
+- [x] Sessions API and availability REST API (`services/api`)
+- [x] Smart-charging allocator and change planner: pure functions, property-tested after every event of random scenarios (D-031)
+- [ ] Simulator: charger-side charging profiles (stack levels, `validTo`, TxDefaultProfile fallback) and the applied-limit checker
 - [ ] charging-controller: reconcile loop, increases only after decreases are acknowledged, short `validTo` leases
-- [ ] Settlement and late-evidence corrections; sessions API; availability REST API
+- [ ] Settlement and late-evidence corrections
+- [ ] Simulator at 2,000 concurrent chargers (needed for result 3 in M5)
 
 ## M4 · Weeks 7–8 · Kubernetes
 

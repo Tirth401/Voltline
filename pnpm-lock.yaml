@@ -231,6 +231,30 @@ importers:
         specifier: 16.0.0
         version: 16.0.0
 
+  packages/routing:
+    dependencies:
+      ioredis:
+        specifier: 6.0.0
+        version: 6.0.0
+
+  services/api:
+    dependencies:
+      '@voltline/availability':
+        specifier: workspace:*
+        version: link:../../packages/availability
+      '@voltline/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@voltline/routing':
+        specifier: workspace:*
+        version: link:../../packages/routing
+      ioredis:
+        specifier: 6.0.0
+        version: 6.0.0
+      pino:
+        specifier: 10.4.0
+        version: 10.4.0
+
   services/gateway:
     dependencies:
       '@voltline/availability':
@@ -248,6 +272,9 @@ importers:
       '@voltline/ocpp':
         specifier: workspace:*
         version: link:../../packages/ocpp
+      '@voltline/routing':
+        specifier: workspace:*
+        version: link:../../packages/routing
       ioredis:
         specifier: 6.0.0
         version: 6.0.0
@@ -283,9 +310,15 @@ importers:
 
   tests/e2e:
     dependencies:
+      '@voltline/api':
+        specifier: workspace:*
+        version: link:../../services/api
       '@voltline/availability':
         specifier: workspace:*
         version: link:../../packages/availability
+      '@voltline/common':
+        specifier: workspace:*
+        version: link:../../packages/common
       '@voltline/db':
         specifier: workspace:*
         version: link:../../packages/db
@@ -295,6 +328,9 @@ importers:
       '@voltline/ocpp':
         specifier: workspace:*
         version: link:../../packages/ocpp
+      '@voltline/routing':
+        specifier: workspace:*
+        version: link:../../packages/routing
       '@voltline/simulator':
         specifier: workspace:*
         version: link:../../simulator

@@ -5,10 +5,13 @@
   "description": "End-to-end tests: simulated chargers against a real gateway, Postgres and Redis",
   "type": "module",
   "dependencies": {
+    "@voltline/api": "workspace:*",
     "@voltline/availability": "workspace:*",
+    "@voltline/common": "workspace:*",
     "@voltline/db": "workspace:*",
     "@voltline/gateway": "workspace:*",
     "@voltline/ocpp": "workspace:*",
+    "@voltline/routing": "workspace:*",
     "@voltline/simulator": "workspace:*",
     "ioredis": "6.0.0",
     "pino": "10.4.0",

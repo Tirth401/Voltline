@@ -3,7 +3,11 @@ import {
   parseFrame,
   serializeCall,
   serializeCallError,
+  serializeCallResult,
+  V16_ACTIONS,
+  type OcppErrorCode,
   type Payload,
+  type V16Action,
   type V16ChargerAction,
   type V16Request,
   type V16Response,
@@ -16,6 +20,11 @@ export interface ClientOptions {
   validator?: V16Validator;
   /** How long to wait for an answer, in real time. Default 10 s. */
   timeoutMs?: number;
+  /**
+   * Answers commands the CSMS sends (RemoteStartTransaction, TriggerMessage…). Throw an
+   * OcppCallError to answer with a CALLERROR. Without it, every command gets NotImplemented.
+   */
+  onCall?: (action: string, payload: Payload) => Promise<Payload>;
 }
 
 /** The gateway answered the WebSocket upgrade with an HTTP error instead of a socket. */
@@ -41,6 +50,7 @@ export class OcppClient {
   readonly #ws: WebSocket;
   readonly #validator: V16Validator | undefined;
   readonly #timeoutMs: number;
+  readonly #onCall: ClientOptions['onCall'];
   #queue: Promise<unknown> = Promise.resolve();
   #waiting: Waiting | undefined;
   #nextMessageId = 1;
@@ -63,11 +73,17 @@ export class OcppClient {
     this.#ws = ws;
     this.#validator = options.validator;
     this.#timeoutMs = options.timeoutMs ?? 10_000;
+    this.#onCall = options.onCall;
     ws.on('message', (data: RawData) => {
       this.#receive(Buffer.isBuffer(data) ? data.toString('utf8') : '');
     });
     ws.on('close', () => {
       this.#fail(new Error('connection closed'));
+    });
+    // A gateway killed mid-conversation resets the connection. Without a listener, that 'error'
+    // event would crash the whole simulator; with one, the waiting call fails and is retried.
+    ws.on('error', (error: Error) => {
+      this.#fail(error);
     });
   }
 
@@ -136,15 +152,39 @@ export class OcppClient {
     });
   }
 
+  /** The CSMS sent us a command: check it as a real charger would, then answer. */
+  async #answerCommand(messageId: string, action: string, payload: Payload): Promise<void> {
+    let reply: string;
+    if (!this.#onCall || !(action in V16_ACTIONS)) {
+      reply = serializeCallError(messageId, 'NotImplemented', `${action} is not simulated`);
+    } else {
+      const valid = this.#validator?.request(action as V16Action, payload);
+      if (valid && !valid.ok) {
+        reply = serializeCallError(messageId, valid.errorCode, valid.description);
+      } else {
+        try {
+          const answer = await this.#onCall(action, payload);
+          const check = this.#validator?.response(action as V16Action, answer);
+          if (check && !check.ok)
+            throw new Error(`simulator bug: ${action} answer ${check.description}`);
+          reply = serializeCallResult(messageId, answer);
+        } catch (error) {
+          reply =
+            error instanceof OcppCallError
+              ? serializeCallError(messageId, error.errorCode as OcppErrorCode, error.message)
+              : serializeCallError(messageId, 'InternalError', String(error));
+        }
+      }
+    }
+    if (this.#ws.readyState === WebSocket.OPEN) this.#ws.send(reply);
+  }
+
   #receive(text: string): void {
     const parsed = parseFrame(text);
     if (!parsed.ok) return;
     const { frame } = parsed;
     if (frame.type === 2) {
-      // The gateway sent us a command. Milestone 1's charger doesn't take any yet.
-      this.#ws.send(
-        serializeCallError(frame.messageId, 'NotImplemented', `${frame.action} not simulated yet`),
-      );
+      void this.#answerCommand(frame.messageId, frame.action, frame.payload);
       return;
     }
     const waiting = this.#waiting;

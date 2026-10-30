@@ -30,8 +30,11 @@ export interface ConnectionOptions {
   logger: Logger;
   /** How long to wait for the charger to answer a CALL we sent. */
   callTimeoutMs: number;
-  /** Sees every frame received and every frame sent, in order: for the frame log (D-023). */
-  onFrame?: (direction: 'in' | 'out', raw: string) => void;
+  /**
+   * Sees every frame received and every frame sent, in order: for the frame log (D-023). An
+   * answer to the charger is held back until the promise this returns for it settles.
+   */
+  onFrame?: (direction: 'in' | 'out', raw: string) => Promise<void> | void;
 }
 
 interface PendingCall {
@@ -73,7 +76,8 @@ export class ChargerConnection {
 
   /** Every text frame from the socket comes through here. */
   receive(text: string): void {
-    this.#onFrame?.('in', text);
+    // Not awaited: this CALL's answer is recorded after it, and waits for both to be stored.
+    void this.#onFrame?.('in', text);
     const parsed = parseFrame(text);
     if (!parsed.ok) {
       this.#log.warn({ reason: parsed.reason, frame: text.slice(0, 200) }, 'malformed frame');
@@ -127,11 +131,14 @@ export class ChargerConnection {
       this.#log.error({ err: error, action: call.action }, 'handler failed');
       outcome = { error: 'InternalError', description: 'internal error' };
     }
-    this.#send(
+    const answer =
       'result' in outcome
         ? serializeCallResult(call.messageId, outcome.result)
-        : serializeCallError(call.messageId, outcome.error, outcome.description),
-    );
+        : serializeCallError(call.messageId, outcome.error, outcome.description);
+    // The answer goes out only once the frame log holds it and the CALL it answers (D-023).
+    if (this.#closed) return;
+    await this.#onFrame?.('out', answer);
+    if (!this.#closed) this.#socket.send(answer);
   }
 
   #callNow(action: string, payload: Payload): Promise<Payload> {
@@ -166,9 +173,10 @@ export class ChargerConnection {
     }
   }
 
+  /** Sends our own CALLs and FormationViolation errors. Logged, but not held back for the log. */
   #send(text: string): void {
     if (this.#closed) return;
     this.#socket.send(text);
-    this.#onFrame?.('out', text);
+    void this.#onFrame?.('out', text);
   }
 }
