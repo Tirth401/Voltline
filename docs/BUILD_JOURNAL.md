@@ -329,8 +329,94 @@ connector reaches its fair target.
   (a "parameter property") in my test code, because Node cannot run it without a build step.
   That is exactly the rule D-003 set up.
 
-_Still to do in Milestone 3: the controller service that sends the limits to real chargers, and
-the simulator's model of how chargers apply them._
+### Part 4: the controller meets the chargers
+
+**What was built** (D-032):
+
+- **A controller service** that runs a loop for one site. Every tick, it reads the site, works out
+  fair targets, and sends the next safe changes to the chargers as SetChargingProfile commands.
+  They travel through the same command bus the API uses.
+- **Simulated chargers that obey limits** the way OCPP 1.6 describes. With no profile, a charger
+  uses its default. A profile only applies to the current session. Each profile has a lease
+  (`validTo`), and when it runs out, the charger goes back to its default by itself.
+- **A recorder** that writes down every limit each charger really applies, with a timestamp. The
+  verdict comes from this record, not from what the controller believes.
+
+**Leases: safety that doesn't need the network.** Each limit is valid for 30 seconds, and the
+controller renews it when half the time is gone. If a charger loses contact with us, its lease
+runs out and it returns to its safe default on its own. Without leases, a charger we can't reach
+would keep a high limit forever, and we could never give that power to another car.
+
+**The hardest case: no answer.** When a command times out, we don't know whether the charger
+applied it. Maybe the command was lost. Maybe the charger applied it and only the answer was lost.
+So the controller counts it as "maybe applied" until its lease would be over. After that, the
+charger is on its default whatever happened. The same goes for a connection that closes _after_
+the command went out: that is "unknown", not "not connected". I had to fix the gateway's command
+code for this.
+
+**A test that failed for the wrong reason.** The first cap test reported a peak of 120,420 W
+against a 60,000 W cap. I suspected the controller, but the bug was in the simulator: when a
+session ended, the charger didn't record going back to its default, so the recorder kept counting
+the old, high limit. When a safety check fails, check the checker too.
+
+**Proving the check can fail.** A test that never fails proves nothing. So the same scenario
+also runs with a careless controller that sends every target at once, with no ordering and no
+worst-case budget. The recorder catches it going over the cap, so the check really works.
+
+**A result that looked too regular.** Five 1,000-change runs with five different seeds all ended
+with exactly 504 arrivals and 496 departures. That looked like a bug, so I investigated before
+writing anything down:
+
+- the random generator was fine: over 200 seeds, the spread of results matched the theory;
+- the load driver with fake chargers gave different results for different seeds;
+- running seeds 2 and 3 again, exactly as before, gave 505/495 and 503/497.
+
+The explanation: an offline spell lasts a real number of milliseconds, so which chargers are
+online at each pick depends on timing. A seed fixes the decisions, not the exact timing. The five
+matching results were a coincidence. Now I can explain them, so I can report them.
+
+**Measuring usefulness changed the design twice.** A controller that does nothing never breaks
+the cap, so every run also measures usefulness: the share of the spare power the chargers were
+really allowed to use (D-016). Once the simulated chargers could lose answers, it showed two
+problems:
+
+1. **Waiting for answers stalled the whole site.** Each tick waited for every answer, so one
+   silent charger held everything up until the timeout. Now ticks don't wait. Answers update the
+   controller's beliefs when they arrive, and a late answer to a change it already gave up on is
+   ignored.
+2. **One of my own rules was too strict.** D-031 said: no increase while any decrease is
+   unconfirmed. But a decrease whose answer is lost stays unconfirmed for a whole lease, so the
+   whole site froze: 32 seconds in production. The worst-case budget already makes sure no
+   increase uses power before it is really free, so the strict rule added nothing to safety.
+   Relaxing it raised usefulness from 75–82% to 83–86% on four seeds, and the cap held every time
+   (D-033).
+
+**What happens when the controller restarts?** A fresh controller remembers nothing. It believes
+every charger is on its default, but a charger may still hold a high limit from before the crash.
+If the new controller gave that power to another car, the site would go over its cap. The fix is
+simple: a fresh controller sends nothing until one lease (plus the clock allowance) has passed.
+By then every old lease is over.
+
+A scripted test shows why the wait is needed. Car A charges alone and gets all the spare power:
+21,720 W of a 30,000 W cap. A's charger drops off the network and keeps that limit. The
+controller restarts, and car B arrives. Without the wait, the new controller gives B its share
+(12,930 W) at once, while A still holds its old limit: 38,790 W in total, far over the cap. With
+the wait, the site never goes above 30,000 W. My first try at this test used random restarts
+instead, and it caught the bug in only 6 runs out of 10. A test that catches a bug "usually" is
+not good enough, so I wrote the script.
+
+**What I learned:**
+
+- **Leases turn "I don't know" into "I know when it ends".** That is what makes unknown outcomes
+  safe.
+- **Measure usefulness next to safety.** Both design changes in this part came from the
+  usefulness number, not from the safety check.
+- **When a result looks too regular, find out why before you report it.** It might be a bug.
+  Here it was chance, and now I can explain it.
+- **A restart is a fault like any other.** Memory is lost; leases are what make that safe.
+
+The numbers are in
+[results/m3-smart-charging-cap.md](results/m3-smart-charging-cap.md).
 
 ---
 

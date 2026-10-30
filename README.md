@@ -5,15 +5,16 @@ chargers using OCPP 1.6J over WebSockets. It rebuilds the hard core of a real ch
 billing that stays exact when chargers misbehave, site power caps that are never exceeded, and
 fast recovery when the gateway restarts.
 
-> **Status:** Milestone 3 is under way.
+> **Status:** Milestone 3's exit check is met.
 >
 > - **Billing under crashes:** 5,000 seeded sessions full of faults are billed to the watt-hour
 >   while three gateway processes are killed with SIGKILL as they run (three seeds out of three).
 > - **Commands:** commands reach a charger through whichever gateway holds its connection.
-> - **Smart charging:** the core is done. It shares a site's cap fairly, and changes limits in an order
->   that is safe at every moment (property-tested).
-> - **Next:** the controller service that sends limits to chargers, and the simulator's model of
->   how chargers apply them.
+> - **Smart charging:** a controller keeps each site under its power cap. Over 1,000 load changes,
+>   with chargers refusing limits, losing answers and dropping offline, and the controller
+>   restarting, the limits the chargers applied never added up to more than the cap (ten runs out
+>   of ten). At a calm pace the chargers got 88–89% of the spare power.
+> - **Next:** settlement and the 2,000-charger simulator, then Kubernetes (Milestone 4).
 >
 > See [docs/ROADMAP.md](docs/ROADMAP.md). To learn how it was built, start with
 > [docs/BUILD_JOURNAL.md](docs/BUILD_JOURNAL.md).
@@ -28,6 +29,8 @@ Each result gets a write-up in `docs/results/` with the exact command, seed, dat
    discrepancies ([write-up](docs/results/m3-billing-with-gateway-kills.md)). Pod kills in
    Kubernetes come next._
 2. **Smart charging:** no site exceeds its power cap across 1,000 simulated load changes.
+   _So far: 1,000 load changes with charger faults and controller restarts, outside Kubernetes;
+   the cap held in every run ([write-up](docs/results/m3-smart-charging-cap.md))._
 3. **Recovery:** 2,000 simulated chargers reconnect after a gateway pod restart in Kubernetes
    (kind), measured from the chargers' side.
 
@@ -87,6 +90,25 @@ charger:
 pnpm replay --schema <kept schema> --charger <chargePointId>
 ```
 
+## Smart charging
+
+```bash
+pnpm cap --changes 1000 --seed 1
+pnpm cap --changes 1000 --seed 1 --gap 150-450
+pnpm cap --changes 1000 --seed 1 --restart-every 5000
+```
+
+Each command runs 20 simulated chargers, a real gateway and the charging controller (D-032) for
+one site with a 150 kW cap, while cars arrive and leave 1,000 times. The chargers refuse some
+limits, lose some answers, and drop offline for 0.5 to 2.5 s, often longer than their 1.5 s
+lease. Each charger records the limits it really applies. The run passes if their total never
+went over the cap, and every connector reached its fair target once the faults stopped.
+
+It also prints usefulness: the share of the spare power the chargers were allowed to use (D-016).
+The default pace, a change every 10 to 40 ms, is a stress test: faster than the controller's
+50 ms tick. `--gap 150-450` is a fairer pace for usefulness. `--restart-every` restarts the
+controller every so many milliseconds, and it forgets everything each time.
+
 ## Running it by hand
 
 ```bash
@@ -96,7 +118,8 @@ pnpm api
 pnpm sim --charger CP-DEMO-1 --tag TAG-DEMO-1 --seed 42
 ```
 
-`db:seed` registers the demo chargers and id tag. The gateway listens on
+`db:seed` registers the demo site, chargers and id tag. `pnpm controller` keeps the demo site
+under its cap (one controller per site; `SITE_ID` picks another). The gateway listens on
 `ws://localhost:9220/ocpp/{chargePointId}`; set `PORT`, `HEARTBEAT_INTERVAL_S` or `LOG_LEVEL` to
 change it. Run `pnpm sim` in a second terminal: it prints the charger's ground truth, including
 `physicalWh` and `evidencedWh`, which you can compare with `energy_wh` in the `transactions`
@@ -104,12 +127,12 @@ table. Copy `.env.example` to `.env` to point everything at a different database
 
 The API listens on `http://localhost:9230`:
 
-| Request                                 | What it does                                                                                                         |
-| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
-| `GET /chargers/{id}`                    | The charger's details, which gateway holds it, and its connectors' live status                                       |
-| `GET /chargers/{id}/sessions`           | Its last 50 sessions, with their bills                                                                               |
-| `GET /sessions/{transactionId}`         | One session and its bill                                                                                             |
-| `POST /chargers/{id}/commands/{action}` | Sends any OCPP command the backend may send (body: the payload), through whichever gateway holds the charger (D-030) |
+| Request                                 | What it does                                                                                                                                                             |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `GET /chargers/{id}`                    | The charger's details, which gateway holds it, and its connectors' live status                                                                                           |
+| `GET /chargers/{id}/sessions`           | Its last 50 sessions, with their bills                                                                                                                                   |
+| `GET /sessions/{transactionId}`         | One session and its bill                                                                                                                                                 |
+| `POST /chargers/{id}/commands/{action}` | Sends any OCPP command the backend may send (body: the payload), through whichever gateway holds the charger (D-030). Charging limits are left to the controller (D-032) |
 
 ## Layout
 
@@ -128,13 +151,14 @@ voltline/
 │   └── smart-charging/       fair power targets and a cap-safe controller step (pure functions)
 ├── services/
 │   ├── api/                  REST: chargers, sessions and bills, commands to chargers
+│   ├── charging-controller/  keeps each site under its power cap with leased limits
 │   └── gateway/              the OCPP 1.6J WebSocket server, its handlers and frame log
 ├── simulator/                seeded chargers that misbehave and record their own ground truth
-├── tests/e2e/                end-to-end tests, the fault and crash harness, pnpm faults / replay
+├── tests/e2e/                end-to-end tests, the fault, crash and cap harnesses, pnpm faults / cap / replay
 └── scripts/                  prereqs.ts (machine check), smoke.ts (run it for real)
 ```
 
-Added as the milestones need them: `services/charging-controller` and `deploy/`.
+Added when Milestone 4 needs it: `deploy/`.
 
 ## Conventions
 

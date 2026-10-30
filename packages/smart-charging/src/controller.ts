@@ -35,17 +35,22 @@ export function siteWorstCaseW(connectors: readonly ConnectorState[]): number {
 }
 
 /**
- * The next limit changes to send, worked out from the current state alone (D-031).
+ * The next limit changes to send, worked out from the current state alone (D-031, D-033).
  *
  * It is level-triggered: it doesn't care which events led here, so a lost or repeated event can
  * delay convergence but never break the cap. Three rules keep the site under its cap at every
  * moment, not just once everything has settled:
  *
- * 1. Decreases go first. While any decrease is unconfirmed, no increase is sent.
+ * 1. Decreases go first: no increase counts on power that a decrease will free until the charger
+ *    confirms that decrease.
  * 2. An increase only uses power that is free even if every connector draws its worst case,
- *    counting changes still in flight.
+ *    counting changes still in flight. A connector with an unconfirmed decrease still counts at
+ *    its old, higher limit, and that is what makes rule 1 hold.
  * 3. A connector with a change in flight gets nothing new until the charger answers, so we never
  *    lose track of which limit it might be applying.
+ *
+ * An unconfirmed decrease doesn't stop other increases. Its answer may be lost, and the whole
+ * site would then wait out a lease for nothing (D-033).
  */
 export function nextChanges(
   capW: number,
@@ -61,11 +66,8 @@ export function nextChanges(
   const decreases = sendable
     .filter((c) => target(c) < c.acknowledgedW)
     .map((c) => ({ key: c.key, limitW: target(c) }));
-  const decreasePending = connectors.some(
-    (c) => c.inFlightW !== undefined && c.inFlightW < c.acknowledgedW,
-  );
-  if (decreases.length > 0 || decreasePending) return decreases;
 
+  // Only power that is free right now, with every decrease (sent or about to be) not yet applied.
   let budgetW = capW - siteWorstCaseW(connectors);
   const increases: LimitChange[] = [];
   for (const c of sendable) {
@@ -76,5 +78,5 @@ export function nextChanges(
       budgetW -= raiseW;
     }
   }
-  return increases;
+  return [...decreases, ...increases];
 }

@@ -39,6 +39,9 @@ class HttpError extends Error {
 
 const MAX_BODY_BYTES = 64 * 1024;
 
+/** Charging limits belong to the charging controller: one set by hand would be invisible to it. */
+const CONTROLLER_ONLY = new Set(['SetChargingProfile', 'ClearChargingProfile']);
+
 const COMMAND_STATUS: Record<CommandOutcome['status'], number> = {
   answered: 200,
   invalid: 400,
@@ -127,6 +130,9 @@ export function createApi(options: ApiOptions): Api {
       'POST',
       /^\/chargers\/([^/]+)\/commands\/([A-Za-z]+)$/,
       async ([chargePointId = '', action = ''], request) => {
+        if (CONTROLLER_ONLY.has(action)) {
+          throw new HttpError(403, `${action} is sent only by the charging controller (D-032)`);
+        }
         const payload = await readJsonObject(request);
         const outcome = await bus.send(chargePointId, action, payload);
         return { status: COMMAND_STATUS[outcome.status], body: outcome };

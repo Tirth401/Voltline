@@ -15,7 +15,9 @@ You don't need the same words. You need the same main idea and one concrete exam
 > them late or in the wrong order, and sometimes their meters reset. I built the server and a
 > simulator of misbehaving chargers. With seeded fault injection, 5,000 sessions are billed
 > exactly to the watt-hour, even while gateway processes are being killed. I can also replay any
-> charger's recorded traffic to reproduce its bills."
+> charger's recorded traffic to reproduce its bills. And it keeps every site under its power cap:
+> over 1,000 load changes, with chargers refusing limits and losing answers, the limits the
+> chargers really applied never went over the cap."
 
 ## The 2-minute walkthrough
 
@@ -32,6 +34,10 @@ You don't need the same words. You need the same main idea and one concrete exam
    against what the simulated meter can prove, and also proves the faults really happened.
 6. **Replay.** Every message is recorded. I can replay a charger into an empty database and get
    the same bills. That needed one trick: translating the server-assigned transaction IDs.
+7. **Smart charging.** A controller shares each site's power cap fairly and sends limits with a
+   lease, so a charger we lose contact with falls back to a safe default by itself. A command with
+   no answer counts as "maybe applied" until its lease is over. The check uses what the chargers
+   really applied, and two deliberately broken controllers prove that the check can fail.
 
 ---
 
@@ -54,6 +60,15 @@ You don't need the same words. You need the same main idea and one concrete exam
 | 377 then 402             | Reconnects in two runs of the same seed: only timing changed; faults and energy were identical | same                                            |
 | 3.5 s → 4.8 s            | What the group commit cost on the 500-session run                                              | `DECISIONS.md` D-023                            |
 | 80 + 45                  | Unit tests + integration tests during Milestone 3                                              | `pnpm check`, `pnpm test:integration`           |
+| 90 + 54                  | Unit tests + integration tests once the smart-charging work was done                           | `pnpm check`, `pnpm test:integration`           |
+| 1,000 load changes × 10  | Smart-charging runs: 20 chargers, a 150 kW cap, chargers refusing limits and losing answers    | `docs/results/m3-smart-charging-cap.md`         |
+| 150,000 W                | The peak in every run: exactly the cap, never a watt more                                      | same                                            |
+| 83 to 469                | Unanswered limit changes per run, each counted as "maybe applied" until its lease ended        | same                                            |
+| 88–89%                   | Usefulness at a calm pace: the share of the spare power the chargers were allowed to use       | same                                            |
+| 120,420 W vs 60,000 W    | The first cap test's peak; the bug was in the simulator, not the controller                    | `DECISIONS.md` D-032                            |
+| 38,790 W vs 30,000 W     | What a restarted controller with no waiting period does, in a scripted test                    | `docs/results/m3-smart-charging-cap.md`         |
+| 75–82% → 83–86%          | Usefulness before and after relaxing the "no increase while a decrease is unconfirmed" rule    | `DECISIONS.md` D-033                            |
+| 504 / 496                | Five runs that ended the same way by chance; reruns gave 505/495 and 503/497                   | `docs/BUILD_JOURNAL.md`, Milestone 3 Part 4     |
 
 ---
 
@@ -251,6 +266,55 @@ The controller works out the next changes from the current state alone, not from
 events that led there. If an event is lost or repeated, the next run still computes the right
 thing. Kubernetes controllers work the same way.
 
+**Q: What is a lease, and why does every limit have one?**
+Each limit I send carries a `validTo` time, 30 seconds ahead, and I renew it when half of it is
+used. If the charger loses contact with us, the lease runs out and the charger goes back to its
+safe default by itself. So safety doesn't depend on the network. Without a lease, a charger I
+can't reach would keep a high limit forever, and I could never give that power to another car.
+
+**Q: A SetChargingProfile times out. What does the controller do?**
+It treats the outcome as unknown. Maybe the charger never got it; maybe it applied it and only
+the answer was lost. So the change counts as "maybe applied" until its lease would be over, plus
+2 seconds for clock differences. After that, the charger is on its default whatever happened. The
+classic bug is to treat a timeout as "not applied" and give the same power to another car.
+
+**Q: How do you check the cap from outside the controller?**
+Each simulated charger records every limit it actually applies, with a timestamp. The test adds
+these up moment by moment, with idle connectors at their default, and takes the highest total.
+The controller's beliefs are not used, so a bug in those beliefs can't hide itself.
+
+**Q: How do you know the cap test can fail?**
+Two broken controllers must fail it, and the tests check that they do. One sends every target at
+once, with no ordering and no worst-case budget. The other is a restart with no waiting period,
+in a scripted test: car A holds all the spare power, its charger goes offline keeping that limit,
+the controller restarts, and car B arrives. The new controller gives B a share while A still holds
+its old limit: 38,790 W against a 30,000 W cap.
+
+**Q: What happens if the controller crashes and restarts?**
+The new one remembers nothing, so it thinks every charger is on its default. But a charger may
+still hold a high limit from before the crash. If the new controller gave that power to another
+car, the site would go over the cap. So a fresh controller sends nothing for one lease plus the
+clock allowance. After that, every old lease has run out and its belief is true again.
+
+**Q: Why doesn't each tick wait for the chargers' answers?**
+Because one silent charger would hold up the whole site until the timeout, and in the meantime
+other leases could run out. Now answers update the controller's beliefs when they arrive. If an
+answer comes after the controller already gave up on that change, it is ignored.
+
+**Q: You changed one of your own rules (D-033). Why?**
+D-031 said no increase while any decrease is unconfirmed. Once my simulated chargers could lose
+answers, the usefulness number showed the cost: a decrease with a lost answer stays unconfirmed
+for a whole lease, so the whole site froze, 32 seconds in production. The worst-case budget
+already makes sure no increase uses power that isn't free yet, so the strict rule added no safety.
+After relaxing it, usefulness went from 75–82% to 83–86% on four seeds, and the cap still held.
+
+**Q: Tell me about a result that looked wrong.**
+Five 1,000-change runs with five different seeds all ended at exactly 504 arrivals and 496
+departures. I didn't report it until I understood it. The random generator passed a check over
+200 seeds, and fake chargers gave different results for different seeds. Rerunning seeds 2 and 3
+gave 505/495 and 503/497. Offline spells last real milliseconds, so the exact split depends on
+timing: a seed fixes the decisions, not the timing. Five matching results were chance.
+
 ### Design choices
 
 **Q: Why is billing inside the gateway and not a separate service?**
@@ -281,6 +345,11 @@ Saying these yourself makes you more convincing, not less.
 - Simulated time is compressed. The run times show how long a test takes on my laptop. They are
   not performance results.
 - Energy hidden by an unreported meter reset is not billed. That is a choice, and we report it.
+- Smart charging is simulated with one connector per charger and one stack level. Leases assume
+  the charger's clock roughly agrees with ours. There is exactly one controller per site, with no
+  leader election, and a fresh one sends no new limits for its first 32 seconds.
+- In the cap stress test, cars arrive and leave faster than the controller's tick, so usefulness
+  there is low by design. The calmer runs are the fair usefulness number.
 
 ---
 
@@ -309,3 +378,9 @@ Saying these yourself makes you more convincing, not less.
 | Pub/sub                | Publish/subscribe: a message sent on a named channel reaches whoever is listening on it right now.    |
 | Registry               | Here, the Redis record of which gateway holds each charger's connection.                              |
 | Epoch                  | A counter that grows with each new connection of a charger, so newer can be told from older.          |
+| Cap                    | The most power a site may draw at once.                                                               |
+| Default limit          | What a charger may draw with no instructions from us (its TxDefaultProfile).                          |
+| Lease (`validTo`)      | The time a limit stops applying unless it is renewed; then the charger falls back to its default.     |
+| Worst case             | The most a connector might be drawing, given changes we sent but haven't heard back about.            |
+| Usefulness             | The share of the spare power the chargers were really allowed to use, over time.                      |
+| Negative control       | A deliberately broken version that the test must catch, to prove the test can fail.                   |

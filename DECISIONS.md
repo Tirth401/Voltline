@@ -226,7 +226,7 @@ telemetry turned off.
 **Why.** Reproducible results need the same database on every machine. A floating `latest` tag
 means two laptops can quietly run different versions.
 
-## D-016 · Smart-charging safety is measured on applied limits, with a usefulness metric (planned)
+## D-016 · Smart-charging safety is measured on applied limits, with a usefulness metric
 
 _2026-10-29_
 
@@ -238,6 +238,8 @@ of the free capacity was allocated, and how fast.
 
 **Why.** Allocating zero to everyone never exceeds the cap. A safety claim without a usefulness
 number is empty.
+
+**Update (D-032).** Both are measured now, from the chargers' own record of the limits they apply.
 
 ## D-017 · Only registered chargers may connect, and a charger's newest connection wins
 
@@ -486,6 +488,8 @@ controller is a pure, level-triggered function of the current state, and follows
 
 A site whose defaults alone exceed its cap is refused when it is configured.
 
+_Rule 2 was replaced after measuring it with lost answers: see D-033._
+
 **Why.** "Never exceeds the cap" must hold at every moment, not just after things settle, and it
 must hold even when answers are lost, refused or late. A property test plays random sequences of
 up to 300 events against the controller: cars arriving and leaving, changes accepted, rejected or
@@ -495,5 +499,106 @@ A second property checks that the controller always reaches its targets once cha
 again. Without it, a controller that allocates nothing would pass the safety test (D-016).
 
 **Not yet.** The controller service that sends SetChargingProfile through the command bus with
-`validTo` leases, and the simulator's model of how chargers apply profiles. Both are the rest of
-M3.
+`validTo` leases, and the simulator's model of how chargers apply profiles. Both came next: see
+D-032.
+
+## D-032 · The charging controller: leases, unknown answers, and the chargers' own record
+
+_2026-10-30_
+
+**Decision.** One controller per site (`services/charging-controller`). Every tick (1 s in
+production, 50 ms in tests) it reads the site as it is now: the cap, the chargers and their open
+sessions from Postgres, and who is connected from the Redis registry. It works out fair targets
+(D-031) and sends the next safe changes as SetChargingProfile through the command bus (D-030).
+
+- **Every limit is a lease.** Each TxProfile carries `validTo`, 30 s ahead by default. The
+  controller refreshes it once half is used up. A charger that stops hearing from us falls back to
+  its default by itself when the lease ends.
+- **Three kinds of outcome.** An answer tells us where the charger stands. A command that never
+  went out (charger not connected, invalid payload) changed nothing. No answer means _unknown_:
+  the change counts as "maybe applied" until its lease would be over, plus 2 s for clocks that
+  disagree. After that the charger is on its default, whatever it did.
+- **A connection that closes after the command went out is unknown too,** not "not connected".
+  The charger may have applied the limit just before its socket died. The gateway's command path
+  first got this wrong; the controller is what made it matter.
+- **Ticks don't wait for answers.** Answers update the controller's belief when they arrive. A late
+  answer to a change it already gave up on is ignored. So one charger that never answers can't
+  hold up the rest of the site.
+- **A fresh controller waits before it sends anything.** It remembers nothing, so it believes every
+  charger is on its default. But a charger may still hold a high limit from before a crash or a
+  deploy. So for one lease plus the clock allowance, a new controller sends nothing; by then every
+  old lease is over.
+- **Exactly one controller per site, and only it sets limits.** Two controllers would each think
+  the spare power is theirs to give. In Kubernetes (M4) this is one replica with
+  `strategy: Recreate`. The REST API refuses SetChargingProfile and ClearChargingProfile, because a
+  limit set by hand would be invisible to the controller.
+
+The simulated chargers follow the parts of OCPP 1.6 the controller relies on. Without a TxProfile
+they apply their default (the TxDefaultProfile). A TxProfile applies only to its own transaction
+and is dropped when that ends. It stops at `validTo`, and one that arrives already expired never
+applies. A charger applies a new profile at the moment it answers, after a seeded delay. It may
+refuse it, and its answer may be lost.
+
+**How it is checked.** A recorder notes every limit each simulated charger actually applies, with
+a timestamp. The peak is the highest total at any moment, with idle connectors at their default.
+The controller's beliefs play no part in the verdict. Usefulness (D-016) comes from the same
+record: over time, the share of the spare power (the cap minus every connector's default) the
+chargers were allowed to use, out of the most that could have been handed out at each moment.
+Two negative controls prove the check can fail. The same scenario with a careless planner (every
+target at once, no ordering, no worst-case budget) must break the cap. And a scripted restart must
+break it without the waiting period: car A holds all the spare power, its charger drops offline
+keeping that limit, the controller restarts, and car B arrives. With no wait, the new controller
+gives B a share at once and the site reaches 38,790 W against a 30,000 W cap. With the wait it
+stays at 30,000 W.
+
+**Why.**
+
+- **Leases make safety local.** Without one, a charger we lose contact with would keep its high
+  limit forever, and its power could never be given to anyone else.
+- **"Unknown" is the honest answer to a timeout.** Treating a timeout as "not applied" is the
+  classic bug: the same power goes to a second car while the first charger may still be using it.
+- **The check must not share the controller's mistakes.** If it read the controller's beliefs, a
+  bug in those beliefs would hide itself.
+- **Found while building it.** The first cap test failed with a peak of 120,420 W against a
+  60,000 W cap. The bug was in the simulator: a charger didn't record falling back to its default
+  when a session stopped, so the recorder kept counting the old limit. A check that fails for the
+  wrong reason still deserves a close look.
+
+**Known limits.**
+
+- If the answer to a lease refresh is lost, the charger can sit on its default for up to the
+  clock allowance plus one tick before the controller raises it again. Safe, slightly wasteful.
+- Leases assume the charger's clock roughly agrees with ours. The 2 s allowance covers small
+  differences, not a charger whose clock is minutes off.
+- The simulator models one connector per charger and a single stack level.
+
+## D-033 · An unconfirmed decrease no longer holds back other increases
+
+_2026-10-30_
+
+**Decision.** D-031's rule "no increase is sent while a decrease is unconfirmed" is replaced. An
+increase may go out while some decrease is still unconfirmed, but only into power that is free
+with every connector at its worst case. A connector with an unconfirmed decrease still counts at
+its old, higher limit, so no increase ever relies on a decrease that hasn't been confirmed.
+
+**Why.** Once the simulated chargers could lose answers (D-032), the strict rule showed a hidden
+cost. A decrease whose answer is lost stays unconfirmed until its lease would be over, and the
+strict rule froze every increase on the site for that long: 1.8 s in the tests, 32 s in
+production. Measured with 200 load changes 150 to 450 ms apart, 8 chargers, a 60 kW cap, and all
+charger faults on:
+
+| Seed | Usefulness, strict rule | Usefulness, new rule | Peak (cap 60,000 W) |
+| ---- | ----------------------- | -------------------- | ------------------- |
+| 2028 | 75.0%                   | 83.0%                | 60,000 W both times |
+| 1    | 75.7%                   | 84.3%                | 60,000 W both times |
+| 2    | 78.6%                   | 85.9%                | 60,000 W both times |
+| 3    | 81.9%                   | 85.8%                | 60,000 W both times |
+
+The property tests (D-031) pass unchanged: the worst case stays under the cap after every event,
+and every connector reaches its target once chargers answer again. A new example test shows the
+difference: a third car gets the power a confirmed decrease freed, while another decrease is
+still unanswered.
+
+**What stays the same.** "Decreases go before increases" still holds in the sense that matters
+for safety: no increase uses a watt until the charger giving it up has confirmed. The order in
+which one tick's changes go out never mattered for safety.

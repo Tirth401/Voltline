@@ -1,0 +1,18 @@
+{
+  "name": "@voltline/charging-controller",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Keeps each site under its power cap by sending chargers their limits",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@voltline/common": "workspace:*",
+    "@voltline/db": "workspace:*",
+    "@voltline/routing": "workspace:*",
+    "@voltline/smart-charging": "workspace:*",
+    "ioredis": "6.0.0",
+    "pino": "10.4.0"
+  }
+}

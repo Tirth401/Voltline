@@ -49,19 +49,25 @@ bill reproduced by replay. Details and limitations:
 - Moved to M3 (D-027): RemoteStartTransaction, RemoteStopTransaction, TriggerMessage, and the smart-charging allocator and change planner
 - Moved to M3, as planned: settlement (active → stopped → settled)
 
-## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1 (in progress)
+## M3 · Weeks 5–6 · Several gateways, cross-pod commands, smart charging v1 (exit check met)
 
 **Exit check:** 5,000 sessions survive gateway process kills with 0 discrepancies; a command sent
 through the API reaches a charger through whichever gateway holds it; the cap holds across 200
 load changes.
 
-**Done so far:** the first two parts of the exit check.
+**Done:** all three parts of the exit check. Settlement and the 2,000-charger simulator are still
+open.
 
 - **Billing under crashes:** 5,000 sessions with gateway kills, on three seeds. Every run had
   0 discrepancies, 0 lost, 0 invented, and every bill was rebuilt by replay
   ([results](results/m3-billing-with-gateway-kills.md)).
 - **Commands:** a command sent through the API reaches a charger on another gateway, and a charger
   moving between gateways makes the old one close its stale socket (both tested).
+- **Smart charging:** the cap held in every run, by the chargers' own record of what they applied:
+  200 load changes in the integration test, plus ten runs of 1,000 load changes with chargers
+  refusing limits, losing answers and dropping offline, and the controller restarting. Two broken
+  controllers break the cap in the integration tests, so the check can fail. Usefulness is
+  reported next to safety: 88–89% at a calm pace ([results](results/m3-smart-charging-cap.md)).
 
 - [x] RemoteStartTransaction, RemoteStopTransaction and TriggerMessage, plus any other CSMS command, all checked against the schemas, through `POST /chargers/:id/commands/:action`
 - [x] Redis connection registry with a per-connection counter (the epoch); a stale socket on the old gateway is closed
@@ -71,8 +77,9 @@ load changes.
 - [x] Frame log as a group commit, so replay survives SIGKILL
 - [x] Sessions API and availability REST API (`services/api`)
 - [x] Smart-charging allocator and change planner: pure functions, property-tested after every event of random scenarios (D-031)
-- [ ] Simulator: charger-side charging profiles (stack levels, `validTo`, TxDefaultProfile fallback) and the applied-limit checker
-- [ ] charging-controller: reconcile loop, increases only after decreases are acknowledged, short `validTo` leases
+- [x] Simulator: charger-side charging profiles (one stack level, `validTo` leases, TxDefaultProfile fallback), lost answers, and the applied-limit recorder (D-032)
+- [x] charging-controller: reconcile loop that never waits for answers, unknown outcomes held until their lease is over, a waiting period after each start (D-032, D-033)
+- [x] REST API refuses SetChargingProfile and ClearChargingProfile: limits belong to the controller
 - [ ] Settlement and late-evidence corrections
 - [ ] Simulator at 2,000 concurrent chargers (needed for result 3 in M5)
 
@@ -86,7 +93,7 @@ real pod kills.
 - [ ] BootNotification rate limiting: Redis token bucket, answering `Pending` with an `interval` when over budget
 - [ ] Simulator as a Job inside the cluster; chaos driver that kills pods on a seeded schedule
 - [ ] **Result 1** write-up
-- [ ] **Result 2:** 1,000 load changes, including chargers dropping mid-change and decreases that are rejected or time out, plus the usefulness metric
+- [ ] **Result 2** again in kind: the same 1,000 load changes with the controller and gateway pods killed (done outside Kubernetes in M3, with controller restarts, refused and lost changes, and usefulness: [results](results/m3-smart-charging-cap.md))
 
 ## M5 · Weeks 9–10 · Reconnect storm and interoperability
 

@@ -237,6 +237,8 @@ importers:
         specifier: 6.0.0
         version: 6.0.0
 
+  packages/smart-charging: {}
+
   services/api:
     dependencies:
       '@voltline/availability':
@@ -248,6 +250,27 @@ importers:
       '@voltline/routing':
         specifier: workspace:*
         version: link:../../packages/routing
+      ioredis:
+        specifier: 6.0.0
+        version: 6.0.0
+      pino:
+        specifier: 10.4.0
+        version: 10.4.0
+
+  services/charging-controller:
+    dependencies:
+      '@voltline/common':
+        specifier: workspace:*
+        version: link:../../packages/common
+      '@voltline/db':
+        specifier: workspace:*
+        version: link:../../packages/db
+      '@voltline/routing':
+        specifier: workspace:*
+        version: link:../../packages/routing
+      '@voltline/smart-charging':
+        specifier: workspace:*
+        version: link:../../packages/smart-charging
       ioredis:
         specifier: 6.0.0
         version: 6.0.0
@@ -316,6 +339,9 @@ importers:
       '@voltline/availability':
         specifier: workspace:*
         version: link:../../packages/availability
+      '@voltline/charging-controller':
+        specifier: workspace:*
+        version: link:../../services/charging-controller
       '@voltline/common':
         specifier: workspace:*
         version: link:../../packages/common
@@ -334,6 +360,9 @@ importers:
       '@voltline/simulator':
         specifier: workspace:*
         version: link:../../simulator
+      '@voltline/smart-charging':
+        specifier: workspace:*
+        version: link:../../packages/smart-charging
       ioredis:
         specifier: 6.0.0
         version: 6.0.0

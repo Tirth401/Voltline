@@ -7,12 +7,14 @@
   "dependencies": {
     "@voltline/api": "workspace:*",
     "@voltline/availability": "workspace:*",
+    "@voltline/charging-controller": "workspace:*",
     "@voltline/common": "workspace:*",
     "@voltline/db": "workspace:*",
     "@voltline/gateway": "workspace:*",
     "@voltline/ocpp": "workspace:*",
     "@voltline/routing": "workspace:*",
     "@voltline/simulator": "workspace:*",
+    "@voltline/smart-charging": "workspace:*",
     "ioredis": "6.0.0",
     "pino": "10.4.0",
     "ws": "8.22.0"

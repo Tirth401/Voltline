@@ -42,7 +42,9 @@ export async function runCommand(
     if (error instanceof OcppCallError) {
       return { status: 'charger-error', errorCode: error.errorCode, description: error.message };
     }
-    const closed = error instanceof Error && error.message.startsWith('connection closed');
-    return closed ? { status: 'not-connected' } : { status: 'timeout' };
+    // Closed before the command went out: the charger never saw it. Anything else (closed after
+    // sending, or no answer in time) is unknown: the charger may well have acted on it (D-032).
+    const neverSent = error instanceof Error && error.message.startsWith('connection closed;');
+    return neverSent ? { status: 'not-connected' } : { status: 'timeout' };
   }
 }

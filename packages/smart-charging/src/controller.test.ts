@@ -141,6 +141,32 @@ describe('nextChanges', () => {
     expect(site.connectors[1]?.inFlightW).toBe(DEFAULT_W + 5_000);
   });
 
+  it('lets an increase use power a confirmed decrease freed while another is unanswered', () => {
+    // Two cars share all 20 kW of spare power. A third arrives, so both must come down.
+    const site = new Site(DEFAULT_W * 3 + 20_000, 3);
+    site.demandW[0] = MAX_W;
+    site.demandW[1] = MAX_W;
+    site.step();
+    site.apply({ kind: 'answer', index: 0, outcome: 'accepted' });
+    site.apply({ kind: 'answer', index: 1, outcome: 'accepted' });
+    expect(site.connectors.map((c) => c.acknowledgedW)).toEqual([
+      DEFAULT_W + 10_000,
+      DEFAULT_W + 10_000,
+      DEFAULT_W,
+    ]);
+
+    site.demandW[2] = MAX_W;
+    site.step();
+    site.apply({ kind: 'answer', index: 1, outcome: 'accepted' }); // B came down
+    site.apply({ kind: 'answer', index: 0, outcome: 'lost' }); // A may still be at its old limit
+    site.step();
+    // The third car gets what B gave up, at once, but nothing A might still be drawing (D-033).
+    const freedByB = DEFAULT_W + 10_000 - (site.connectors[1]?.acknowledgedW ?? 0);
+    expect(freedByB).toBeGreaterThan(0);
+    expect(site.connectors[2]?.inFlightW).toBe(DEFAULT_W + freedByB);
+    expect(siteWorstCaseW(site.connectors)).toBe(site.capW);
+  });
+
   it('never lets the worst case exceed the cap, whatever happens and in whatever order', () => {
     fc.assert(
       fc.property(scenario, ([count, capW, script]) => {

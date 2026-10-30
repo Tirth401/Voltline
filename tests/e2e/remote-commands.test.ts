@@ -148,6 +148,21 @@ describe('commands through the API', () => {
     }
   });
 
+  it('leaves charging limits to the charging controller', async () => {
+    for (const action of ['SetChargingProfile', 'ClearChargingProfile']) {
+      const { status, body } = await request(
+        'POST',
+        `/chargers/${CHARGER.chargePointId}/commands/${action}`,
+        {},
+      );
+      expect({ action, status, error: body['error'] }).toEqual({
+        action,
+        status: 403,
+        error: `${action} is sent only by the charging controller (D-032)`,
+      });
+    }
+  });
+
   it('starts and stops a session remotely, and bills it exactly', async () => {
     const started = await request(
       'POST',
